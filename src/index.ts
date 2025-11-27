@@ -18,7 +18,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const SCRAPE_INTERVAL = 2 * 60 * 1000; // changed this from 15 mins to 2
+const SCRAPE_INTERVAL = 15 * 60 * 1000;
 
 let isScrapingInProgress = false;
 let lastRunTime: Date | null = null;
