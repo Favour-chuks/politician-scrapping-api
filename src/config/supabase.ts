@@ -8,19 +8,4 @@ if (!supabase_service_role_key || !supabase_url) {
   throw new Error('Missing Supabase environment variables');
 }
 
-// TODO: remember to remove this 
-const options = {
-  db: {
-    schema: 'public',
-  },
-  auth: {
-    autoRefreshToken: false,   
-    persistSession: false,     
-    detectSessionInUrl: false
-  },
-  global: {
-    headers: { 'x-app-name': 'stock-news-scraper' },
-  },
-} as const
-
 export const supabase = createClient<Database>(supabase_url, supabase_service_role_key);
