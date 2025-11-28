@@ -18,7 +18,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const SCRAPE_INTERVAL = 15 * 60 * 1000;
+const SCRAPE_INTERVAL = 5 * 60 * 1000;
 
 let isScrapingInProgress = false;
 let lastRunTime: Date | null = null;
@@ -79,7 +79,7 @@ async function scrapeAndTweet() {
           
           logger.info({ feed: feed.name, url, articlesFound: rssFeed.length }, 'RSS feed processing completed');
         } catch (feedError: any) {
-          logger.error({ feed: feed.name, url, error: feedError?.message || String(feedError) }, 'Error processing RSS feed');
+          logger.error({ feed: feed.name, url, error: feedError.message }, 'Error processing RSS feed');
         }
       }
     }

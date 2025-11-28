@@ -274,9 +274,7 @@ export class DatabaseRepository {
   }
 
   async getArticlesByStock(ticker: string, limit = 50) {
-    if (!this.checkSupabase()) return [];
-
-    const { data, error } = await supabase!
+    const { data, error } = await supabase
       .from('article_stocks')
       .select(`
         *,
@@ -291,9 +289,7 @@ export class DatabaseRepository {
   }
 
   async getBullishArticles(limit = 50) {
-    if (!this.checkSupabase()) return [];
-
-    const { data, error } = await supabase!
+    const { data, error } = await supabase
       .from('article_stocks')
       .select(`*, articles (*)`)
       .eq('trend', 'bullish')
@@ -309,9 +305,7 @@ export class DatabaseRepository {
     status: 'success' | 'failed' | 'partial',
     errors?: any[]
   ) {
-    if (!this.checkSupabase()) return;
-
-    const { error } = await supabase!
+    const { error } = await supabase
       .from('scraping_logs')
       .insert({
         source,
@@ -324,9 +318,7 @@ export class DatabaseRepository {
   }
 
   async getScrapingLogs(source?: string, limit = 100) {
-    if (!this.checkSupabase()) return [];
-
-    let query = supabase!
+    let query = supabase
       .from('scraping_logs')
       .select('*')
       .order('started_at', { ascending: false })
