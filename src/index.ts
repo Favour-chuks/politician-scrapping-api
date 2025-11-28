@@ -79,7 +79,7 @@ async function scrapeAndTweet() {
           
           logger.info({ feed: feed.name, url, articlesFound: rssFeed.length }, 'RSS feed processing completed');
         } catch (feedError: any) {
-          logger.error({ feed: feed.name, url, error: feedError.message }, 'Error processing RSS feed');
+          logger.error({ feed: feed.name, url, error: feedError?.message || String(feedError) }, 'Error processing RSS feed');
         }
       }
     }

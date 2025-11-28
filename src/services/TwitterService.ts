@@ -74,6 +74,18 @@ export class TwitterService {
    * Get or create tweet quota for current month
    */
   private async getTweetQuota(): Promise<TweetQuota> {
+    if (!supabase) {
+      // Return a default quota when Supabase is not available
+      const currentMonth = this.getCurrentMonth();
+      const currentDate = this.getCurrentDate();
+      return {
+        month: currentMonth,
+        tweets_sent: 0,
+        last_tweet_date: currentDate,
+        daily_tweets_sent: 0
+      };
+    }
+
     const currentMonth = this.getCurrentMonth();
     const currentDate = this.getCurrentDate();
 
@@ -174,10 +186,15 @@ export class TwitterService {
    * Increment tweet counters
    */
   private async incrementTweetCount(): Promise<void> {
+    if (!supabase) {
+      logger.warn('Supabase not configured - tweet count not persisted');
+      return;
+    }
+
     const currentMonth = this.getCurrentMonth();
 
-  const { error } = await supabase
-    .rpc('increment_tweet_count', { month_param: currentMonth });
+    const { error } = await supabase
+      .rpc('increment_tweet_count', { month_param: currentMonth });
 
     if (error) throw error;
   }

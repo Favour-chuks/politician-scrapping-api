@@ -7,14 +7,24 @@ type ArticleInsert = Database['public']['Tables']['articles']['Insert'];
 type StockInsert = Database['public']['Tables']['stocks']['Insert'];
 
 export class DatabaseRepository {
+  private checkSupabase() {
+    if (!supabase) {
+      logger.warn('Supabase is not configured. Skipping database operation.');
+      return false;
+    }
+    return true;
+  }
+
   async ensureStocksExist(stocks: StockInsert[]) {
+    if (!this.checkSupabase()) return;
+
     const formatted = stocks.map(s => ({
       ticker: s.ticker.toUpperCase(),
       company_name: s.company_name || s.ticker.toUpperCase(),
       sector: s.sector || null
     }));
 
-    const { error } = await supabase
+    const { error } = await supabase!
       .from('stocks')
       .upsert(formatted, { onConflict: 'ticker', ignoreDuplicates: true });
 
@@ -22,7 +32,9 @@ export class DatabaseRepository {
   }
 
   async getStock(ticker: string) {
-    const { data, error } = await supabase
+    if (!this.checkSupabase()) return null;
+
+    const { data, error } = await supabase!
       .from('stocks')
       .select('*')
       .eq('ticker', ticker.toUpperCase())
@@ -33,7 +45,9 @@ export class DatabaseRepository {
   }
 
   async getAllStocks() {
-    const { data, error } = await supabase
+    if (!this.checkSupabase()) return [];
+
+    const { data, error } = await supabase!
       .from('stocks')
       .select('*')
       .order('ticker');
@@ -44,8 +58,9 @@ export class DatabaseRepository {
 
  async createArticlesBatch(articles: Article[]) {
    if (articles.length === 0) return [];
+   if (!this.checkSupabase()) return [];
 
-   const { data: newArticles, error: articleError } = await supabase
+   const { data: newArticles, error: articleError } = await supabase!
      .from('articles')
      .insert(articles.map(a => ({
        title: a.title,
@@ -80,7 +95,7 @@ export class DatabaseRepository {
    });
 
    if (articleStocks.length > 0) {
-     const { error } = await supabase
+     const { error } = await supabase!
        .from('article_stocks')
        .insert(articleStocks);
 
@@ -101,7 +116,9 @@ export class DatabaseRepository {
  }
 
   async createArticle(article: ArticleInsert) {
-    const { data, error } = await supabase
+    if (!this.checkSupabase()) return null as any;
+
+    const { data, error } = await supabase!
       .from('articles')
       .insert({
         title: article.title,
@@ -120,6 +137,8 @@ export class DatabaseRepository {
   }
 
   async createArticleWithStocks(article: Article) {
+  if (!this.checkSupabase()) return null as any;
+
   if(article.aiAnalysis.length > 0) {
    const stocksToInsert = article.aiAnalysis.map(s => ({
     ticker: s.label.toUpperCase(),
@@ -128,14 +147,14 @@ export class DatabaseRepository {
     market_cap: null
    }));
    
-   const {error: stockError } = await supabase
+   const {error: stockError } = await supabase!
    .from('stocks')
    .upsert(stocksToInsert, {onConflict: 'ticker', ignoreDuplicates: true});
 
    if (stockError) throw stockError;
   }
 
-  const { data: newArticle, error: articleError } = await supabase
+  const { data: newArticle, error: articleError } = await supabase!
   .from('articles')
   .insert({
    title: article.title,
@@ -161,7 +180,7 @@ export class DatabaseRepository {
     explanation: s.explanation ?? null
    }));
 
-   const { error: linkError } = await supabase
+   const { error: linkError } = await supabase!
        .from('article_stocks') 
        .insert(articleStocksToInsert);
 
@@ -172,7 +191,9 @@ export class DatabaseRepository {
   }
 
   async getArticleById(id: string) {
-    const { data, error } = await supabase
+    if (!this.checkSupabase()) return null;
+
+    const { data, error } = await supabase!
       .from('articles')
       .select(`
         *,
@@ -189,7 +210,9 @@ export class DatabaseRepository {
   }
 
   async getArticlesBySource(source: string, limit = 50) {
-    const { data, error } = await supabase
+    if (!this.checkSupabase()) return [];
+
+    const { data, error } = await supabase!
       .from('articles')
       .select('*')
       .eq('source', source)
@@ -201,7 +224,9 @@ export class DatabaseRepository {
   }
 
   async getRecentArticles(limit = 50) {
-    const { data, error } = await supabase
+    if (!this.checkSupabase()) return [];
+
+    const { data, error } = await supabase!
       .from('articles')
       .select(`
         *,
@@ -218,7 +243,9 @@ export class DatabaseRepository {
   }
 
   async articleExists(url: string): Promise<boolean> {
-    const { data } = await supabase
+    if (!this.checkSupabase()) return false;
+
+    const { data } = await supabase!
       .from('articles')
       .select('id')
       .eq('url', url)
@@ -228,7 +255,9 @@ export class DatabaseRepository {
   }
 
   async createArticleStocks(articleId: string, article:Article){
-   const { error } = await supabase
+   if (!this.checkSupabase()) return;
+
+   const { error } = await supabase!
    .from('article_stocks')
    .insert(
     article.aiAnalysis.map(s => ({
@@ -245,7 +274,9 @@ export class DatabaseRepository {
   }
 
   async getArticlesByStock(ticker: string, limit = 50) {
-    const { data, error } = await supabase
+    if (!this.checkSupabase()) return [];
+
+    const { data, error } = await supabase!
       .from('article_stocks')
       .select(`
         *,
@@ -260,7 +291,9 @@ export class DatabaseRepository {
   }
 
   async getBullishArticles(limit = 50) {
-    const { data, error } = await supabase
+    if (!this.checkSupabase()) return [];
+
+    const { data, error } = await supabase!
       .from('article_stocks')
       .select(`*, articles (*)`)
       .eq('trend', 'bullish')
@@ -276,7 +309,9 @@ export class DatabaseRepository {
     status: 'success' | 'failed' | 'partial',
     errors?: any[]
   ) {
-    const { error } = await supabase
+    if (!this.checkSupabase()) return;
+
+    const { error } = await supabase!
       .from('scraping_logs')
       .insert({
         source,
@@ -289,7 +324,9 @@ export class DatabaseRepository {
   }
 
   async getScrapingLogs(source?: string, limit = 100) {
-    let query = supabase
+    if (!this.checkSupabase()) return [];
+
+    let query = supabase!
       .from('scraping_logs')
       .select('*')
       .order('started_at', { ascending: false })
