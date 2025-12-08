@@ -66,20 +66,22 @@ async function scrapeAndTweet() {
 
               logger.debug({ tweet }, 'Generated tweet');
 
-              const tweetResponse = await twitter.tweet(tweet);
-              logger.info({ tweetId: tweetResponse.data.id }, 'Tweet posted successfully');
+              // const tweetResponse = await twitter.tweet(tweet);
+              // logger.info({ tweetId: tweetResponse.data.id }, 'Tweet posted successfully');
               totalTweets++;
 
               await new Promise(resolve => setTimeout(resolve, 5000));
 
             } catch (tweetError: any) {
-              logger.error({ error: tweetError.message, articleUrl: article.url }, 'Failed to tweet article');
+              logger.error({ error: tweetError?.message, articleUrl: article.url }, 'Failed to tweet article');
             }
           }
           
           logger.info({ feed: feed.name, url, articlesFound: rssFeed.length }, 'RSS feed processing completed');
-        } catch (feedError: any) {
-          logger.error({ feed: feed.name, url, error: feedError.message }, 'Error processing RSS feed');
+        } catch (feedError) {
+          if(feedError instanceof Error){
+            logger.error({ feed: feed.name, url, error: feedError?.message || String(feedError) }, 'Error processing RSS feed');
+          }
         }
       }
     }

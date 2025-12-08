@@ -15,7 +15,24 @@ class ValkeyClient {
      throw new Error("Aiven Valkey configuration is incomplete");
    }
 
-    this.client = new Redis(uri);
+
+    // Parse the URI to check if it uses TLS
+    const usesTLS = uri.startsWith('valkeys://') || uri.startsWith('rediss://');
+    
+    // Configure with TLS support if needed
+    const options: RedisOptions = usesTLS ? {
+      tls: {
+        // For Aiven, you typically don't need to specify certificates
+        // as they use browser-recognized CAs
+        rejectUnauthorized: true
+      },
+      connectTimeout: 10000, // 10 seconds instead of default
+      maxRetriesPerRequest: 3
+    } : {
+      connectTimeout: 10000
+    };
+
+    this.client = new Redis(uri, options);
     // Connection events
     this.client.on('connect', () => {
       logger.info("Connected to Aiven Valkey")
