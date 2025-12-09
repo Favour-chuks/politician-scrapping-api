@@ -40,5 +40,12 @@
     "noUncheckedSideEffectImports": true,
     "moduleDetection": "force",
     "skipLibCheck": true,
-  }
+
+  },
+    "exclude": [
+    "node_modules",
+    "dist",           // ← Add this
+    "**/*.spec.ts",
+    "**/*.test.ts"
+  ]
 }

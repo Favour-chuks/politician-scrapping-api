@@ -2,7 +2,7 @@ import { GoogleGenAI } from '@google/genai';
 import { config } from '../config/environmentalVariables.js';
 import { tickerExtractor } from '../prompts/tickerExtractor.js';
 import { logger } from '../utils/Logger.js';
-import ValkeyOperations from '../../dist/services/ValkeyOperations.js';
+import ValkeyOperations from '../services/ValkeyOperations.js';
 
 
 
