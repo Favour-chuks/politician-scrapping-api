@@ -27,7 +27,7 @@ interface RequestRecord {
 class AiAssignment {
   private GeminiAi: GoogleGenAI;
   private rateLimits: RateLimitConfig;
-  private ValkeyOps = new ValkeyOperations();
+  private ValkeyOps;
   private readonly RATE_LIMIT_PREFIX = 'gemini:ratelimit:';
   private readonly REQUEST_KEY = `${this.RATE_LIMIT_PREFIX}requests`;
   private readonly LAST_RESET_KEY = `${this.RATE_LIMIT_PREFIX}last_reset`;
@@ -39,6 +39,7 @@ class AiAssignment {
       throw new Error("Gemini API Key is not defined in environment variables");
     }
 
+    this.ValkeyOps = new ValkeyOperations()
     this.GeminiAi = new GoogleGenAI({ apiKey: gemini_api_key });
     
     // Default limits for gemini-2.5-flash (free tier)
