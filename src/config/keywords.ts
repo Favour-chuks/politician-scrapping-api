@@ -581,15 +581,10 @@ export const contentThresholds = {
   }
 };
 
-// TODO: come back and finish the trend detector
-// export const getTrend = async (text: string): Promise<"bearish" | "bullish"> => {
-//   return "bullish"
-// }
 
 export const getTrend = (text: string): "bearish" | "bullish" => {
   const lowerText = text.toLowerCase();
   
-  // Bullish indicators
   const bullishKeywords = [
     'surge', 'soar', 'rally', 'gain', 'rise', 'climb', 'jump', 'spike',
     'record high', 'all-time high', 'breakthrough', 'success', 'beat expectations',
@@ -599,7 +594,6 @@ export const getTrend = (text: string): "bearish" | "bullish" => {
     'exceeds', 'confidence', 'strength', 'robust', 'thriving'
   ];
   
-  // Bearish indicators
   const bearishKeywords = [
     'plunge', 'crash', 'fall', 'drop', 'decline', 'sink', 'tumble', 'slump',
     'collapse', 'downturn', 'losses', 'miss', 'disappointing', 'weak',
@@ -612,7 +606,6 @@ export const getTrend = (text: string): "bearish" | "bullish" => {
   let bullishScore = 0;
   let bearishScore = 0;
   
-  // Count bullish keywords
   for (const keyword of bullishKeywords) {
     const regex = new RegExp(`\\b${keyword}\\b`, 'gi');
     const matches = lowerText.match(regex);
@@ -621,7 +614,6 @@ export const getTrend = (text: string): "bearish" | "bullish" => {
     }
   }
   
-  // Count bearish keywords
   for (const keyword of bearishKeywords) {
     const regex = new RegExp(`\\b${keyword}\\b`, 'gi');
     const matches = lowerText.match(regex);
@@ -630,7 +622,5 @@ export const getTrend = (text: string): "bearish" | "bullish" => {
     }
   }
   
-  // Return trend based on scores
-  // Default to bullish if neutral (equal scores)
   return bearishScore > bullishScore ? 'bearish' : 'bullish';
 };

@@ -12,7 +12,7 @@ export type Article = {
   isRssFeed: boolean;
   rippleValidity?: 'HIGH' | 'MODERATE' | 'LOW',
   trend?: "bearish" | "bullish",
-  aiAnalysis: AiAssignmentType[];
+  aiAnalysis?: AiAssignmentType[];
 }
 
 export interface KeywordWeight {

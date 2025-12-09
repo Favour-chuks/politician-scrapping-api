@@ -84,7 +84,7 @@ export class DatabaseRepository {
      const articleId = urlToId.get(article.url);
      if (!articleId) return [];
      
-     return article.aiAnalysis.map(analysis => ({
+     return article.aiAnalysis?.map(analysis => ({
        article_id: articleId,
        ticker: analysis.label.toUpperCase(),
        confidence: analysis.confidence,
@@ -97,7 +97,7 @@ export class DatabaseRepository {
    if (articleStocks.length > 0) {
      const { error } = await supabase!
        .from('article_stocks')
-       .insert(articleStocks);
+       .insert(articleStocks.filter(item => item != undefined));
 
      if (error) throw error;
    }
@@ -139,8 +139,10 @@ export class DatabaseRepository {
   async createArticleWithStocks(article: Article) {
   if (!this.checkSupabase()) return null as any;
 
+  if(!article.aiAnalysis) throw new Error("cannnot create Article with stocks");
+
   if(article.aiAnalysis.length > 0) {
-   const stocksToInsert = article.aiAnalysis.map(s => ({
+   const stocksToInsert = article.aiAnalysis?.map(s => ({
     ticker: s.label.toUpperCase(),
     company_name: s.name || s.label.toUpperCase(),
     sector: null,
@@ -256,6 +258,9 @@ export class DatabaseRepository {
 
   async createArticleStocks(articleId: string, article:Article){
    if (!this.checkSupabase()) return;
+
+    if(!article.aiAnalysis) throw new Error("cannnot create Article with stocks");
+
 
    const { error } = await supabase!
    .from('article_stocks')

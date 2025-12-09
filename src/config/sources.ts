@@ -1,9 +1,8 @@
 export type HtmlSelectors = {
-  // CSS selectors to help find article lists/links and extract title/content
-  articleListSelector?: string; // page that lists articles
-  articleLinkSelector?: string; // selector inside list to get href
-  titleSelector?: string; // selector on the article page to get title
-  contentSelector?: string; // selector on the article page to get article body
+  articleListSelector?: string;
+  articleLinkSelector?: string;
+  titleSelector?: string;
+  contentSelector?: string;
 };
 
 export type NewsSource = {
@@ -11,10 +10,10 @@ export type NewsSource = {
   name: string;
   baseUrl: string;
   hasRss: boolean;
-  rssUrls?: string[]; // empty array when unknown
-  rssPreferred?: boolean; // prefer RSS when available
+  rssUrls?: string[];
+  rssPreferred?: boolean;
   htmlSelectors?: HtmlSelectors;
-  htmlUrls?: string[]; // pages to scrape for HTML changes if no RSS
+  htmlUrls?: string[];
   notes?: string;
 };
 
@@ -100,7 +99,7 @@ export const newsSources: NewsSource[] = [
       'https://www.bloomberg.com/industries',
       'https://www.bloomberg.com/industries/energy'
     ],
-    rssPreferred: true
+    rssPreferred: false
   },
   {
     id: 'washingtonpost',
@@ -114,7 +113,7 @@ export const newsSources: NewsSource[] = [
 ];
 
 export function getRssSources(): NewsSource[] {
-  return newsSources.filter(s => s.hasRss && s.rssUrls && s.rssUrls.length > 0);
+  return newsSources.filter(s => s.hasRss && s.rssPreferred && s.rssUrls && s.rssUrls.length > 0);
 }
 
 export function getHtmlOnlySources(): NewsSource[] {

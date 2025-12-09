@@ -126,22 +126,13 @@ export class NewsMonitoringService {
       }
 
       for (const it of items) {
-        const title = it.title || '';
-        const link = it.link || '';
-        const description = it.contentSnippet ?? it.content ?? it['content:encoded'] ?? it.description ?? '';
-        const pubDate = it.isoDate ? new Date(it.isoDate) : (it.pubDate ? new Date(it.pubDate) : new Date());
-        const encodedContent = it['content:encoded'] ? this.extractTextFromHtml(it['content:encoded']) : '';
-        const categories = (it.categories || [])
-          .map((cat: any) => (typeof cat === 'object' && cat._ ? cat._ : String(cat)))
-          .join(', ');
-        
-        const rawId = it.guid ?? it.id ?? `${link}|${pubDate.toISOString()}`;
-        const itemId = crypto.createHash('sha1').update(String(rawId)).digest('hex');
+        const {title, link, description, pubDate, encodedContent, categories, id,} = this.processRSSItem(it);
+        const itemId = crypto.createHash('sha1').update(id).digest('hex');
 
         const alreadySeen = await this.valkeyAdvanced.sismember(feedKey, itemId);
         if (alreadySeen) continue;
 
-        const content = `${title} --- ${this.extractTextFromHtml(String(description))} --- ${encodedContent} --- ${categories}`.trim().toLowerCase();
+        const content = `${title} --- ${description} --- ${encodedContent} --- ${categories}`.trim().toLowerCase();
 
         const analysis = this.matchKeywords(content);
         
@@ -150,7 +141,7 @@ export class NewsMonitoringService {
           analysis.uniqueKeywordCount >= this.contentThresholds.rss.requiredKeywords
         ) {
           await this.valkeyAdvanced.sadd(feedKey, itemId);
-          
+
           const aiAnalysis = await new AiAssignment().geminiAiAssignment(content);
           const trend = await getTrend(content)
           const article: Article = {
@@ -168,6 +159,7 @@ export class NewsMonitoringService {
           };
           
           results.push(article);
+          
         }
       }
       
@@ -189,19 +181,71 @@ export class NewsMonitoringService {
     }
   }
   
+  private  processRSSItem(it: any){
+    const title = this.cleanData(it.title || '');
+    
+    const link = this.cleanData(it.link || ''); 
+
+     const rawDescription = 
+      it.contentSnippet ?? 
+      it.content ?? 
+      it['content:encoded'] ?? 
+      it.description ?? 
+      '';
+    const description = this.cleanData(String(rawDescription));
+    
+    const pubDate = it.isoDate 
+      ? new Date(it.isoDate) 
+      : (it.pubDate ? new Date(it.pubDate) : new Date());
+    
+    const encodedContent = it['content:encoded'] 
+      ? this.cleanData(it['content:encoded']) 
+      : '';
+    
+    // Process categories
+    const categories = (it.categories || [])
+      .map((cat: any) => {
+        const catValue = typeof cat === 'object' && cat._ ? cat._ : String(cat);
+        return this.cleanData(String(catValue));
+      })
+      .join(', ');
+    
+    
+    const rawId = it.guid ?? it.id ?? `${link}|${pubDate.toISOString()}`;
+    const id =  this.cleanData(rawId) 
+
+    return {
+      title,
+      link,
+      description,
+      pubDate,
+      encodedContent,
+      categories,
+      id
+    };
+  }
+
   private escapeRegex(str: string) {
     return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
-  private extractTextFromHtml(html: string): string {
-    let t = html.replace(/<script[\s\S]*?<\/script>/gi, ' ');
-    t = t.replace(/<style[\s\S]*?<\/style>/gi, ' ');
-    t = t.replace(/<[^>]+>/g, ' ');
-    return this.decodeHtmlEntities(t).replace(/\s+/g, ' ').trim();
+  private cleanData(html: string): string {
+    return this.decodeHtmlEntities(html).trim();
   }
 
   private decodeHtmlEntities(str: string): string {
-    return str.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+    return str
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<!\[CDATA\[/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/\]\]>/g, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
   }
 
   private matchKeywords(content: string) {

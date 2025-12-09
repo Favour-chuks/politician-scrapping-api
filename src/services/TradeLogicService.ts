@@ -1,7 +1,7 @@
 import type { TradeSignal } from '../models/TradeSignal.js';
 
 export class TradeLogicService {
-  private aiModel: any; // TODO: Replace with actual AI model type
+  private aiModel: any;
   
   async analyzeTradeOpportunity(newsSignal?: TradeSignal, volumeSignal?: TradeSignal): Promise<TradeSignal> {
     const riskLevel = this.calculateRiskLevel(newsSignal, volumeSignal);
@@ -40,7 +40,6 @@ export class TradeLogicService {
   }
 
   private async validateTradeSignal(signal: TradeSignal): Promise<TradeSignal> {
-    // TODO: Implement AI validation logic
     const aiValidation = await this.aiModel.validate(signal);
     
     return {

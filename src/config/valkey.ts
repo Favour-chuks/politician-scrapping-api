@@ -22,11 +22,9 @@ class ValkeyClient {
     // Configure with TLS support if needed
     const options: RedisOptions = usesTLS ? {
       tls: {
-        // For Aiven, you typically don't need to specify certificates
-        // as they use browser-recognized CAs
         rejectUnauthorized: true
       },
-      connectTimeout: 10000, // 10 seconds instead of default
+      connectTimeout: 10000,
       maxRetriesPerRequest: 3
     } : {
       connectTimeout: 10000

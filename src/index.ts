@@ -52,6 +52,7 @@ async function scrapeAndTweet() {
       for (const url of feed.rssUrls) {
         try {
           logger.info({ feed: feed.name, url }, 'Processing RSS feed');
+
           const rssFeed = await newsMonitoringService.monitorRssFeedWithRedis(url);
           totalArticles += rssFeed.length;
           
@@ -66,8 +67,8 @@ async function scrapeAndTweet() {
 
               logger.debug({ tweet }, 'Generated tweet');
 
-              // const tweetResponse = await twitter.tweet(tweet);
-              // logger.info({ tweetId: tweetResponse.data.id }, 'Tweet posted successfully');
+              const tweetResponse = await twitter.tweet(tweet);
+              logger.info({ tweetId: tweetResponse.data.id }, 'Tweet posted successfully');
               totalTweets++;
 
               await new Promise(resolve => setTimeout(resolve, 5000));
@@ -80,7 +81,7 @@ async function scrapeAndTweet() {
           logger.info({ feed: feed.name, url, articlesFound: rssFeed.length }, 'RSS feed processing completed');
         } catch (feedError) {
           if(feedError instanceof Error){
-            logger.error({ feed: feed.name, url, error: feedError?.message || String(feedError) }, 'Error processing RSS feed');
+            logger.error({ feed: feed.name, url, error: feedError?.message || String(feedError) }, 'Error processing RSS feed', feedError.message);
           }
         }
       }
