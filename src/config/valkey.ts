@@ -24,10 +24,10 @@ class ValkeyClient {
       tls: {
         rejectUnauthorized: true
       },
-      connectTimeout: 10000,
-      maxRetriesPerRequest: 3
+      connectTimeout: 20000,
+      maxRetriesPerRequest: 5
     } : {
-      connectTimeout: 10000
+      connectTimeout: 20000
     };
 
     this.client = new Redis(uri, options);

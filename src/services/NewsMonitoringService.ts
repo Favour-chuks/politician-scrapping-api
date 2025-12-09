@@ -12,6 +12,7 @@ import ValkeyAdvanced from './ValkeyAdvanced.js';
 import ValkeyOperations from './ValkeyOperations.js';
 import { db } from '../database/supabase.database.js';
 import AiAssignment from './AiAssignment.js';
+import { logger } from '../utils/Logger.js';
 
 
 
@@ -174,10 +175,12 @@ export class NewsMonitoringService {
       try {
         await db.logScraping(feedUrl, 'failed', [error.message]);
       } catch (logError) {
-        throw error('Failed to log scraping error', logError)
-      }
-      
-      throw error(error)
+        logger.error({ 
+          originalError: error.message,
+          logError: logError instanceof Error ? logError.message : String(logError)
+        }, 'Failed to log scraping error to database');
+     }
+     throw error;
     }
   }
   
