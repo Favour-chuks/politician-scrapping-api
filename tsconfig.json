@@ -39,12 +39,12 @@
     "isolatedModules": true,
     "noUncheckedSideEffectImports": true,
     "moduleDetection": "force",
-    "skipLibCheck": true,
-
+    "skipLibCheck": true
   },
-    "exclude": [
+  "include": ["src/**/*"],
+  "exclude": [
     "node_modules",
-    "dist",           // ← Add this
+    "dist", // ← Add this
     "**/*.spec.ts",
     "**/*.test.ts"
   ]

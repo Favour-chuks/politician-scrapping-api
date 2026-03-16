@@ -1,9 +1,9 @@
 import axios, { type AxiosInstance } from 'axios';
+import dns from 'dns';
+import https from 'https';
 import crypto from 'crypto';
 import Parser from 'rss-parser';
 import CacheableLookup from 'cacheable-lookup';
-import dns from 'dns';
-import https from 'https';
 
 import type { Article, KeywordWeight } from '../models/Article.js';
 import { keywordWeights, contentThresholds, getTrend } from '../config/keywords.js';
@@ -113,10 +113,17 @@ export class NewsMonitoringService {
     
     try {
       const res = await this.rssParser.parseURL(feedUrl);
+
+      // const res = await 
+      // this.smartGet(`https://rss2json.com/v1/api.json?rss_url=${encodeURIComponent(feedUrl)}`).then(r => r?.data)
+
       if (!res) return [];
       
       const items = (res.items || []) as any[];
-      if (!items.length) return [];
+      if (!items.length) {
+        logger.info('No items in feed')
+        return [];
+      }
 
       const feedKey = `rss:seen:${crypto.createHash('md5').update(feedUrl).digest('hex')}`;
       const feedExists = await this.valkeyOps.exists(feedKey);

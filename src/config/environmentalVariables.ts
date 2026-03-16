@@ -26,5 +26,7 @@ export const config = {
  twitter_access_token_secret: process.env.TWITTER_ACCESS_TOKEN_SECRET,
  supabase_api_key: process.env.SUPABASE_API_KEY,
  supabase_url: process.env.SUPABASE_URL,
- supabase_service_role_key: process.env.SUPABASE_SERVICE_ROLE_KEY
+ supabase_service_role_key: process.env.SUPABASE_SERVICE_ROLE_KEY,
+ posthog_api_key: process.env.POSTHOG_API_KEY,
+ posthog_host: process.env.POSTHOG_HOST,
 }
