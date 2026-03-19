@@ -9,7 +9,7 @@ import OAuth from 'oauth-1.0a';
 import { createHmac } from 'crypto';
 import axios from 'axios';
 import { PostHog } from 'posthog-node';
-import yahooFinance from 'yahoo-finance2';
+import YahooFinance from 'yahoo-finance2';
 import type { HistoricalResult } from 'yahoo-finance2/modules/historical';
 
 import { config } from '../config/environmentalVariables.js';
@@ -30,6 +30,7 @@ const phClient = new PostHog(
   { host: config.posthog_host ?? "https://us.i.posthog.com" }
 );
 
+const yahooFinance = new YahooFinance();
 // ─────────────────────────────────────────────
 // TYPES
 // ─────────────────────────────────────────────
