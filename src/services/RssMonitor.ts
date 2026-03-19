@@ -22,7 +22,7 @@ import { logger } from '../utils/Logger.js';
 const POLL_INTERVAL_MS  = 30 * 60 * 1000;      // 30 minutes
 const SEEN_WINDOW_MS    = 24 * 60 * 60 * 1000; // forget seen URLs after 24 hours
 const JACCARD_THRESHOLD = 0.30;                 // headlines 30%+ similar = same story
-const CLUSTER_WINDOW_MS = 2 * 60 * 1000;       // wait 2 min for corroborating sources
+const CLUSTER_WINDOW_MS = 30 * 1000;            // wait 30s for corroborating sources
 
 // ─────────────────────────────────────────────
 // SEEN URL CACHE
@@ -295,6 +295,188 @@ async function parseFeed(
   return articles;
 }
 
+import { createClient } from '@supabase/supabase-js';
+import { config } from '../config/environmentalVariables.js';
+
+const supabase = createClient(
+  config.supabase_url!,
+  config.supabase_service_role_key!
+);
+
+// ─────────────────────────────────────────────
+// PRE-COMPUTATION (runs BEFORE any Gemini call)
+// ─────────────────────────────────────────────
+// Everything computed here is free. Results are injected into metadata
+// so the agent can skip the equivalent tool calls and use the values directly.
+//
+// Offloaded from the agent:
+//   1. Content quality gate          — no LLM needed
+//   2. Exact URL duplicate check     — Supabase, no LLM
+//   3. Similar headline check        — Supabase, no LLM
+//   4. Repeat subject check          — Supabase ticker overlap, no LLM
+//   5. Phase 1 ticker candidates     — regex token scan, no LLM
+//   6. Article age in hours          — arithmetic, no LLM
+//   7. Rough relevance floor score   — deterministic signals only, no LLM
+//
+// If the rough score is below MIN_RELEVANCE_FLOOR the article is dropped
+// entirely before Gemini is ever called — saves the full ~$0.00056 per run.
+
+const MIN_BODY_LENGTH      = 100;
+const MIN_HEADLINE_WORDS   = 5;
+const DUPLICATE_WINDOW_H   = 6;
+const REPEAT_SUBJECT_WINDOW_H = 24;
+const MIN_RELEVANCE_FLOOR  = 30;   // drop articles that can't possibly reach 70
+
+// Financial keyword signals used for the rough floor score only
+// (agent does the real semantic scoring — this just filters obvious noise)
+const FINANCIAL_KEYWORDS = new Set([
+  "earnings","revenue","profit","loss","merger","acquisition","ipo","fed",
+  "rate","inflation","gdp","recession","bankruptcy","layoffs","strike",
+  "sanctions","tariff","bond","yield","deficit","surplus","trade","oil",
+  "price","market","stock","shares","quarterly","annual","guidance",
+  "forecast","outlook","deal","agreement","lawsuit","ruling","penalty",
+  "dividend","buyback","split","halt","circuit","crash","rally","surge",
+]);
+
+function roughRelevanceFloor(news: NewsObject): number {
+  let score = 0;
+  const text = `${news.headline} ${news.body}`.toLowerCase();
+
+  // Keyword presence — basic signal that this is financial news at all
+  let kwHits = 0;
+  for (const kw of FINANCIAL_KEYWORDS) {
+    if (text.includes(kw)) kwHits++;
+    if (kwHits >= 3) break;
+  }
+  score += kwHits * 5; // max +15
+
+  // Corroborating sources from metadata (already computed by rss-monitor)
+  const srcCount = (news.metadata?.corroboratingSourceCount as number) ?? 1;
+  if (srcCount >= 3) score += 15;
+  else if (srcCount === 2) score += 10;
+
+  // Article age — penalise stale single-source articles
+  const ageH = (Date.now() - new Date(news.publishedAt).getTime()) / 3_600_000;
+  if (ageH > 6 && srcCount === 1) score -= 15;
+  if (ageH <= 2) score += 10;
+
+  return Math.max(0, score);
+}
+
+function extractCandidateTickers(text: string): string[] {
+  // Phase 1 of the agent's detect_tickers — uppercase token scan
+  // Passed to agent in metadata so it can skip re-doing this regex work
+  return Array.from(
+    new Set((text.match(/\b[A-Z]{1,10}\b/g) ?? []))
+  ).filter((t) =>
+    // Filter obvious non-tickers: common English words, single letters
+    t.length > 1 &&
+    !["I","A","THE","AND","OR","BUT","IN","ON","AT","TO","BY","US","UK","EU",
+      "CEO","CFO","COO","IPO","ETF","GDP","FED","SEC","NYSE","IMF","WHO",
+      "FBI","CIA","NATO","UN","AI","EV","IT","HR","PR","AM","PM","EST","UTC",
+    ].includes(t)
+  );
+}
+
+interface PreComputedContext {
+  passes:             boolean;
+  skipReason?:        string;
+  candidateTickers:   string[];
+  articleAgeHours:    number;
+  isRepeatSubject:    boolean;
+  repeatSubjectTickers?: string[] | undefined;
+  roughRelevanceFloor: number;
+}
+
+async function preCompute(news: NewsObject): Promise<PreComputedContext> {
+  // ── 1. Content quality ────────────────────────────────────────────────────
+  if (news.headline.trim().split(/\s+/).length < MIN_HEADLINE_WORDS) {
+    return { passes: false, skipReason: "short_headline",
+             candidateTickers: [], articleAgeHours: 0,
+             isRepeatSubject: false, roughRelevanceFloor: 0 };
+  }
+  if (news.body.length < MIN_BODY_LENGTH) {
+    return { passes: false, skipReason: "stub_body",
+             candidateTickers: [], articleAgeHours: 0,
+             isRepeatSubject: false, roughRelevanceFloor: 0 };
+  }
+
+  // ── 2. Exact URL duplicate ────────────────────────────────────────────────
+  const { data: byUrl } = await supabase
+    .from("articles").select("id").eq("url", news.url).maybeSingle();
+  if (byUrl) {
+    return { passes: false, skipReason: "url_duplicate",
+             candidateTickers: [], articleAgeHours: 0,
+             isRepeatSubject: false, roughRelevanceFloor: 0 };
+  }
+
+  // ── 3. Similar headline in last DUPLICATE_WINDOW_H hours ─────────────────
+  const dupSince  = new Date(Date.now() - DUPLICATE_WINDOW_H * 3_600_000).toISOString();
+  const snippet   = news.headline.slice(0, 60);
+  const { data: byTitle } = await supabase
+    .from("articles").select("id")
+    .ilike("title", `%${snippet}%`)
+    .gte("scraped_at", dupSince).limit(1);
+  if (byTitle && byTitle.length > 0) {
+    return { passes: false, skipReason: "headline_duplicate",
+             candidateTickers: [], articleAgeHours: 0,
+             isRepeatSubject: false, roughRelevanceFloor: 0 };
+  }
+
+  // ── 4. Phase 1 ticker scan (offloaded from agent STEP 1) ─────────────────
+  const candidateTickers = extractCandidateTickers(`${news.headline} ${news.body}`);
+
+  // ── 5. Repeat subject check (offloaded from agent STEP 6.5) ──────────────
+  // Check if any recently analyzed articles share 2+ tickers with this one.
+  // The agent still saves the analysis — but now it knows upfront not to post.
+  let isRepeatSubject    = false;
+  let repeatSubjectTickers: string[] | undefined;
+
+  if (candidateTickers.length >= 2) {
+    const repeatSince = new Date(Date.now() - REPEAT_SUBJECT_WINDOW_H * 3_600_000).toISOString();
+    const { data: recentArticles } = await supabase
+      .from("articles")
+      .select("tickers")
+      .overlaps("tickers", candidateTickers)
+      .gte("analyzed_at", repeatSince)
+      .limit(10);
+
+    if (recentArticles && recentArticles.length > 0) {
+      for (const row of recentArticles) {
+        const overlap = (row.tickers as string[]).filter(
+          (t: string) => candidateTickers.includes(t)
+        );
+        if (overlap.length >= 2) {
+          isRepeatSubject       = true;
+          repeatSubjectTickers  = overlap;
+          break;
+        }
+      }
+    }
+  }
+
+  // ── 6. Article age ────────────────────────────────────────────────────────
+  const articleAgeHours = (Date.now() - new Date(news.publishedAt).getTime()) / 3_600_000;
+
+  // ── 7. Rough relevance floor ──────────────────────────────────────────────
+  const floor = roughRelevanceFloor(news);
+  if (floor < MIN_RELEVANCE_FLOOR) {
+    logger.debug(`  ⏭ Pre-compute SKIP (floor score ${floor} < ${MIN_RELEVANCE_FLOOR}): "${news.headline}"`);
+    return { passes: false, skipReason: "below_relevance_floor",
+             candidateTickers, articleAgeHours, isRepeatSubject,
+             roughRelevanceFloor: floor };
+  }
+
+  return {
+    passes:              true,
+    candidateTickers,
+    articleAgeHours,
+    isRepeatSubject,
+    repeatSubjectTickers,
+    roughRelevanceFloor: floor,
+  };
+}
+
 // ─────────────────────────────────────────────
 // CONCURRENCY QUEUE
 // ─────────────────────────────────────────────
@@ -307,7 +489,7 @@ async function parseFeed(
 // Flow: dispatch() → enqueue() → drainQueue() → analyzeNews()
 
 const MAX_CONCURRENT = 5;
-const MAX_QUEUE_SIZE = 50;
+const MAX_QUEUE_SIZE = 250;  // large enough to hold a full poll cycle without drops
 
 let   activeCount  = 0;
 const queue: { news: NewsObject; tag: string }[] = [];
@@ -340,15 +522,56 @@ function drainQueue(): void {
       `queued: ${queue.length}]: "${item.news.headline}"`
     );
 
-    analyzeNews(item.news)
-      .catch((err:any) => {
-        logger.error(`analyzeNews() failed for "${item.news.headline}": ${err}`);
-        // Un-mark URL so the story can be retried on the next poll
-        seenUrls.delete(item.news.url);
+    // Run all free pre-computation before burning any Gemini tokens.
+    // Results are injected into metadata so the agent skips redundant work.
+    preCompute(item.news)
+      .then((ctx) => {
+        if (!ctx.passes) {
+          logger.debug(`  ⏭ Skipped [${ctx.skipReason}]: "${item.news.headline}"`);
+          activeCount--;
+          drainQueue();
+          return;
+        }
+
+        // ── Body truncation ───────────────────────────────────────────────
+        // The agent only needs enough body to extract data points and assess
+        // signal quality. Full articles add ~1,000+ tokens per turn × 10 turns.
+        // 600 chars captures the lead paragraph which contains all key facts.
+        const MAX_BODY_CHARS = 600;
+        const truncatedBody  = item.news.body.length > MAX_BODY_CHARS
+          ? item.news.body.slice(0, MAX_BODY_CHARS).replace(/\s+\S*$/, "") + "…"
+          : item.news.body;
+
+        // Inject pre-computed context into metadata — agent reads these directly
+        const enrichedNews: NewsObject = {
+          ...item.news,
+          body: truncatedBody,
+          metadata: {
+            ...item.news.metadata,
+            candidateTickers:     ctx.candidateTickers,
+            articleAgeHours:      Math.round(ctx.articleAgeHours * 10) / 10,
+            isRepeatSubject:      ctx.isRepeatSubject,
+            repeatSubjectTickers: ctx.repeatSubjectTickers ?? [],
+            roughRelevanceFloor:  ctx.roughRelevanceFloor,
+          },
+        };
+
+        if (ctx.isRepeatSubject) {
+          logger.info(
+            `♻️  Repeat subject [${ctx.repeatSubjectTickers?.join(", ")}] — ` +
+            `agent will save analysis but skip posting: "${item.news.headline}"`
+          );
+        }
+
+        return analyzeNews(enrichedNews)
+          .catch((err) => {
+            logger.error(`analyzeNews() failed for "${item.news.headline}": ${err}`);
+            seenUrls.delete(item.news.url);
+          });
       })
       .finally(() => {
         activeCount--;
-        drainQueue(); // process next item in queue when a slot frees up
+        drainQueue();
       });
   }
 }
@@ -397,7 +620,7 @@ function dispatch(cluster: PendingCluster): void {
     source:      primary.news.source,
     url:         primary.news.url,
     publishedAt: primary.news.publishedAt,
-    category:    primary.news.category!,
+    category:    primary.news.category ?? "general",
     metadata: {
       // The AI agent reads these three fields from the system prompt to:
       //   1. Boost market confidence (+8 for 2 sources, +15 for 3, +20 for 4+)
@@ -422,7 +645,10 @@ function dispatch(cluster: PendingCluster): void {
 function addToCluster(article: RawArticle): void {
   // Try to find an existing cluster this article belongs to
   for (const cluster of pendingClusters) {
-    if (jaccard(article.tokens, cluster.items[0]?.tokens!) >= JACCARD_THRESHOLD) {
+    const firstItem = cluster.items[0];
+    if (!firstItem) continue;
+    
+    if (jaccard(article.tokens, firstItem.tokens) >= JACCARD_THRESHOLD) {
       // Same story — add if this source isn't already in the cluster
       const duplicate = cluster.items.some((i) => i.sourceId === article.sourceId);
       if (!duplicate) cluster.items.push(article);
@@ -450,7 +676,7 @@ async function poll(): Promise<void> {
   evictExpired();
 
   const sources  = getRssSources();
-  const feedUrls = sources.flatMap((s:any) => s.rssUrls ?? []);
+  const feedUrls = sources.flatMap((s) => s.rssUrls ?? []);
 
   logger.info(
     `🔄 RSS poll starting — ${sources.length} source(s), ${feedUrls.length} feed(s)`
@@ -461,8 +687,8 @@ async function poll(): Promise<void> {
   // Fetch all feeds in parallel
   // Promise.allSettled ensures one failing feed never blocks the others
   const results = await Promise.allSettled(
-    sources.flatMap((source:any) =>
-      (source.rssUrls ?? []).map(async (feedUrl:any) => {
+    sources.flatMap((source) =>
+      (source.rssUrls ?? []).map(async (feedUrl) => {
         const articles = await parseFeed(feedUrl, source.name, source.id);
 
         for (const article of articles) {

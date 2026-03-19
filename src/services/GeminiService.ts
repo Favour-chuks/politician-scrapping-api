@@ -1,4 +1,3 @@
-import { PostHog } from 'posthog-node'
 import { 
   GoogleGenAI,
   Type,
@@ -9,12 +8,12 @@ import { createClient } from '@supabase/supabase-js';
 import OAuth from 'oauth-1.0a';
 import { createHmac } from 'crypto';
 import axios from 'axios';
-
-
+import { PostHog } from 'posthog-node';
+import yahooFinance from 'yahoo-finance2';
+import type { HistoricalResult } from 'yahoo-finance2/modules/historical';
 
 import { config } from '../config/environmentalVariables.js';
 import { logger } from '../utils/Logger.js';
-
 
 
 // ─────────────────────────────────────────────
@@ -43,7 +42,7 @@ export interface NewsObject {
   source: string;
   url: string;
   publishedAt: string; // ISO 8601
-  category?: string;
+  category?: string ;
   metadata?: Record<string, unknown>;
 }
 
@@ -110,43 +109,47 @@ export interface AnalysisResult {
   newsId: string;
   articleDbId: string;
   alreadyInDatabase: boolean;
+  /** Result of the volatility gate in STEP 1A. SKIP = no analysis posted. */
+  volatilityGate: "PROCEED" | "SKIP";
+  /** VIX closing level at time of analysis. */
+  vixLevel: number;
+  /** VIX context bucket. */
+  vixContext: "HIGH" | "ELEVATED" | "LOW";
   affectedTickers: string[];
   newTickersInserted: string[];
   contradiction: ContradictionResult | null;
   alignment: AlignmentResult | null;
   marketImpact: MarketImpact;
+  signalQuality: "HIGH" | "MEDIUM" | "LOW";
+  relevanceScore: number;
+  isRepeatSubject: boolean;
   /**
-   * Tweet 1 — data/analysis post (main tweet).
-   * Contains: tickers, market prediction + confidence, contradiction/alignment
-   * signal + score, source name, news URL, hashtags. Signal emojis (📈📉⚡⚠️).
-   * Stored in analysis_results.tweet in the DB.
+   * Main tweet — plain text only, no link, no formatting.
+   * Stored in analysis_results.tweet.
    */
-  tweet1: string;
+  mainTweet: string;
   /**
-   * Tweet 2 — opinion/take (quote-tweet of tweet1).
-   * Gemini's human, conversational interpretation of the news and its market
-   * implications. NOT stored in DB — returned in API response only.
+   * Reply tweet — contains only the article URL.
+   * Posted as first reply to mainTweet. Not stored in DB.
    */
-  tweet2: string;
-  /** Result of posting tweet1 to Twitter. Populated after STEP 9. */
-  tweet1PostResult: TweetPostResult;
+  replyTweet: string;
   /**
-   * Result of posting tweet2 as a quote-tweet.
-   * null  → Gemini decided the content wouldn't perform well, skipped entirely.
-   * object with posted:false → Gemini tried but it failed after retries.
+   * Quote tweet — engagement-driven hook.
+   * Only posted if mainTweet gets > 100 impressions in 20 minutes.
+   * Not stored in DB.
    */
-  tweet2PostResult: TweetPostResult | null;
-  /** Gemini's reasoning for whether tweet2 was worth posting. */
-  tweet2AlgoDecision: string;
-}
-
-/** Result of a single tweet post attempt via the Twitter API */
-export interface TweetPostResult {
-  posted:        boolean;
-  tweetId?:      string;   // Twitter's assigned ID — needed for quote-tweet chaining
-  tweetUrl?:     string;   // https://twitter.com/i/web/status/<id>
-  reason?:       string;   // populated when posted === false
-  delayMinutes?: number;   // how long the tool waited before posting (tweet2 only)
+  quoteTweet: string;
+  /** Result of posting the main tweet. */
+  mainTweetPostResult: TweetPostResult;
+  /** Result of posting the link reply. */
+  replyPostResult: TweetPostResult;
+  /**
+   * Result of posting the quote tweet.
+   * null → impressions threshold not met, skipped.
+   */
+  quoteTweetPostResult: TweetPostResult | null;
+  /** Impressions on mainTweet after 20 min. */
+  mainTweetImpressions: number;
 }
 
 // ─────────────────────────────────────────────
@@ -160,25 +163,60 @@ function scoreToLabel(score: number): ScoreLabel {
   return "Low";
 }
 
+// ─────────────────────────────────────────────
+// GEMINI KEY ROTATION POOL
+// ─────────────────────────────────────────────
+// Supports up to 5 free-tier API keys from DIFFERENT Google Cloud projects.
+// Each project gets its own 250 RPD and 10 RPM quota on gemini-2.5-flash.
+//
+// Add keys to your .env:
+//   GEMINI_API_KEY_1=...
+//   GEMINI_API_KEY_2=...
+//   GEMINI_API_KEY_3=...   (optional)
+//   GEMINI_API_KEY_4=...   (optional)
+//   GEMINI_API_KEY_5=...   (optional)
+//
+// ─────────────────────────────────────────────
+// GEMINI RATE LIMITER
+// ─────────────────────────────────────────────
+// Single API key with exponential backoff on 429s.
 
-const TWEETS_URL = "https://api.twitter.com/2/tweets";
- 
-const twitterOAuth = new OAuth({
-  consumer: {
-    key:    config.twitter_api_key!,
-    secret: config.twitter_key_secret!,
-  },
-  signature_method: "HMAC-SHA1",
-  hash_function(base_string, key) {
-    return createHmac("sha1", key).update(base_string).digest("base64");
-  },
-});
- 
-const twitterToken = {
-  key:    config.twitter_access_token!,
-  secret: config.twitter_access_token_secret!,
-};
- 
+const GEMINI_MODEL        = "gemini-2.5-flash";
+const GEMINI_RPM          = 10;                                         // paid tier: raise to 150
+const GEMINI_MIN_GAP_MS   = Math.ceil((60 / GEMINI_RPM) * 1000);       // 6 000 ms
+const GEMINI_MAX_RETRIES  = 6;
+const GEMINI_BACKOFF_BASE = 15_000;                                     // 15 s — doubles each retry
+
+let lastGeminiRequestAt = 0;
+
+async function rateLimitedSend<T>(fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; attempt <= GEMINI_MAX_RETRIES; attempt++) {
+    const elapsed = Date.now() - lastGeminiRequestAt;
+    if (elapsed < GEMINI_MIN_GAP_MS) {
+      await new Promise<void>((r) => setTimeout(r, GEMINI_MIN_GAP_MS - elapsed));
+    }
+
+    try {
+      lastGeminiRequestAt = Date.now();
+      return await fn();
+    } catch (err: unknown) {
+      const msg    = err instanceof Error ? err.message : String(err);
+      const is429  = msg.includes("429") ||
+        (typeof (err as Record<string, unknown>).status === "number" &&
+          (err as Record<string, unknown>).status === 429);
+
+      if (!is429 || attempt === GEMINI_MAX_RETRIES) throw err;
+
+      const waitMs = GEMINI_BACKOFF_BASE * Math.pow(2, attempt);
+      logger.warn(
+        `⏳ Gemini rate limit hit (attempt ${attempt + 1}/${GEMINI_MAX_RETRIES}). ` +
+        `Retrying in ${waitMs / 1000}s...`
+      );
+      await new Promise<void>((r) => setTimeout(r, waitMs));
+    }
+  }
+  throw new Error("rateLimitedSend: exceeded max retries");
+}
 
 // ─────────────────────────────────────────────
 // SUPABASE CLIENT
@@ -190,10 +228,294 @@ const supabase = createClient(
 );
 
 // ─────────────────────────────────────────────
+// TWITTER OAUTH 1.0A CLIENT
+// ─────────────────────────────────────────────
+// Requires four env vars:
+//   TWITTER_API_KEY             (consumer key)
+//   TWITTER_API_SECRET          (consumer secret)
+//   TWITTER_ACCESS_TOKEN        (user access token)
+//   TWITTER_ACCESS_TOKEN_SECRET (user access token secret)
+
+const TWEETS_URL = "https://api.twitter.com/2/tweets";
+
+const twitterOAuth = new OAuth({
+  consumer: {
+    key:    config.twitter_api_key!,
+    secret: config.twitter_key_secret!,
+  },
+  signature_method: "HMAC-SHA1",
+  hash_function(base_string, key) {
+    return createHmac("sha1", key).update(base_string).digest("base64");
+  },
+});
+
+const twitterToken = {
+  key:    config.twitter_access_token!,
+  secret: config.twitter_access_token_secret!,
+};
+
+// ── Auto-like helper ──────────────────────────────────────────────────────────
+// Automatically likes every tweet posted by the account immediately after posting.
+// Uses the Twitter v2 likes endpoint: POST /2/users/:id/likes
+// The authenticated user's ID is fetched once at startup and cached.
+// This is infrastructure — not an agent decision.
+
+let cachedUserId: string | null = null;
+
+async function getAuthenticatedUserId(): Promise<string | null> {
+  if (cachedUserId) return cachedUserId;
+
+  const url = "https://api.twitter.com/2/users/me";
+  const authHeader = twitterOAuth.toHeader(
+    twitterOAuth.authorize({ url, method: "GET" }, twitterToken)
+  );
+
+  try {
+    const res = await axios.get(url, {
+      headers: {
+        Authorization: authHeader["Authorization"],
+        Accept:        "application/json",
+      },
+    });
+    cachedUserId = res.data?.data?.id as string ?? null;
+    if (cachedUserId) logger.info(`🐦 Twitter user ID cached: ${cachedUserId}`);
+    return cachedUserId;
+  } catch (err: unknown) {
+    logger.warn(`Could not fetch Twitter user ID: ${err}`);
+    return null;
+  }
+}
+
+async function likeTweet(tweetId: string): Promise<void> {
+  const userId = await getAuthenticatedUserId();
+  if (!userId) {
+    logger.warn(`⚠️  Auto-like skipped — could not resolve user ID for tweet ${tweetId}`);
+    return;
+  }
+
+  const url = `https://api.twitter.com/2/users/${userId}/likes`;
+  const authHeader = twitterOAuth.toHeader(
+    twitterOAuth.authorize({ url, method: "POST" }, twitterToken)
+  );
+
+  try {
+    await axios.post(
+      url,
+      { tweet_id: tweetId },
+      {
+        headers: {
+          Authorization:  authHeader["Authorization"],
+          "Content-Type": "application/json",
+          Accept:         "application/json",
+        },
+      }
+    );
+    logger.info(`❤️  Auto-liked tweet: ${tweetId}`);
+  } catch (err: unknown) {
+    // Non-fatal — failed likes don't affect the pipeline
+    const reason = axios.isAxiosError(err)
+      ? `${err.response?.status} ${JSON.stringify(err.response?.data)}`
+      : String(err);
+    logger.warn(`Auto-like failed for ${tweetId}: ${reason}`);
+  }
+}
+
+// ─────────────────────────────────────────────
+// MACRO PROXY MAPPING
+// ─────────────────────────────────────────────
+// Moved out of the system prompt to save ~300 tokens per turn.
+// Referenced in system prompt as "MACRO_PROXIES constant".
+// The agent uses this via the tool declaration description.
+
+export const MACRO_PROXIES: Record<string, string[]> = {
+  "uk_rates":        ["EWU", "HSBA", "LLOY", "BARC", "GBP=X"],
+  "us_fed":          ["SPY", "QQQ", "TLT", "IEF"],
+  "us_inflation":    ["TIP", "RINF", "SPY"],
+  "oil_energy":      ["USO", "XLE", "OXY", "CVX", "XOM"],
+  "gold":            ["GLD", "IAU", "GDX"],
+  "europe_ecb":      ["EZU", "FEZ", "EWG"],
+  "china_hk":        ["FXI", "MCHI", "EWH"],
+  "geopolitical":    ["GLD", "USO", "LMT", "RTX", "NOC"],
+  "crypto_reg":      ["BTC-USD", "ETH-USD", "COIN", "MSTR"],
+  "usd_dxy":         ["UUP", "EEM", "GLD"],
+  "us_recession":    ["SPY", "QQQ", "TLT", "HYG"],
+  "semiconductors":  ["NVDA", "AMD", "INTC", "SMH"],
+  "banking_credit":  ["XLF", "JPM", "BAC", "KRE"],
+};
+
+// ─────────────────────────────────────────────
 // TOOL IMPLEMENTATIONS
 // ─────────────────────────────────────────────
 
 const toolImplementations: Record<string, (args: Record<string, unknown>) => Promise<unknown>> = {
+
+  // ── scan_ticker_volatility ────────────────────────────────────────────────
+  // Fetches volatility metrics for a list of tickers from Yahoo Finance.
+  // Called FIRST in STEP 1 — gates the entire analysis.
+  //
+  // Metrics computed per ticker:
+  //   HV30    — 30-day historical volatility (annualised std dev of log returns)
+  //             Low < 15% | Medium 15–35% | High > 35%
+  //   ATR14%  — 14-day Average True Range as % of current price
+  //             Low < 0.8% | Medium 0.8–2% | High > 2%
+  //   IVProxy — implied volatility proxy: if options data available, use IV from
+  //             nearest ATM call. Falls back to "unavailable" for ETFs/indices.
+  //   VIXLevel — current ^VIX close. Context for overall market fear.
+  //             Low < 15 | Elevated 15–25 | High > 25
+  //
+  // Gate logic:
+  //   PROCEED  — at least one ticker has HV30 > 15% OR ATR14% > 0.8%
+  //              OR VIX > 20 (elevated market environment)
+  //   SKIP     — ALL tickers are low volatility AND VIX < 20
+  //              News in a dead market is noise — don't post it.
+  scan_ticker_volatility: async (args: Record<string, unknown>) => {
+    const { tickers } = args as { tickers: string[] };
+
+    if (!tickers || tickers.length === 0) {
+      return { gate: "SKIP", reason: "no_tickers", results: [] };
+    }
+
+    // ── Fetch VIX for market-wide context ────────────────────────────────────
+    let vixLevel = 0;
+    try {
+      const vixData = await yahooFinance.quote("^VIX", { fields: ["regularMarketPrice"] });
+      vixLevel = (vixData as { regularMarketPrice?: number }).regularMarketPrice ?? 0;
+    } catch {
+      logger.warn("VIX fetch failed — proceeding without market context");
+    }
+
+    // ── Helper: compute HV30 from daily close prices ──────────────────────────
+    function computeHV30(closes: number[]): number {
+      if (closes.length < 2) return 0;
+      const logReturns: number[] = [];
+      for (let i = 1; i < closes.length; i++) {
+        logReturns.push(Math.log(closes[i]! / closes[i - 1]!));
+      }
+      const mean = logReturns.reduce((s, r) => s + r, 0) / logReturns.length;
+      const variance = logReturns.reduce((s, r) => s + (r - mean) ** 2, 0) / (logReturns.length - 1);
+      return Math.sqrt(variance) * Math.sqrt(252) * 100; // annualised %
+    }
+
+    // ── Helper: compute ATR14 as % of price ──────────────────────────────────
+    function computeATRPct(
+      highs: number[], lows: number[], closes: number[], currentPrice: number
+    ): number {
+      if (highs.length < 2) return 0;
+      const trs: number[] = [];
+      for (let i = 1; i < Math.min(highs.length, 15); i++) {
+        const hl  = highs[i]!  - lows[i]!;
+        const hpc = Math.abs(highs[i]!  - closes[i - 1]!);
+        const lpc = Math.abs(lows[i]!   - closes[i - 1]!);
+        trs.push(Math.max(hl, hpc, lpc));
+      }
+      const atr14 = trs.reduce((s, t) => s + t, 0) / trs.length;
+      return currentPrice > 0 ? (atr14 / currentPrice) * 100 : 0;
+    }
+
+    // ── Per-ticker analysis ───────────────────────────────────────────────────
+    const results: Array<{
+      ticker:   string;
+      hv30:     number;
+      atr14Pct: number;
+      ivProxy:  string;
+      price:    number;
+      verdict:  "LOW" | "MEDIUM" | "HIGH";
+      reason:   string;
+    }> = [];
+
+    const end   = new Date();
+    const start = new Date(end.getTime() - 45 * 24 * 60 * 60 * 1000); // 45 days for ATR buffer
+
+    await Promise.allSettled(
+      tickers.map(async (ticker) => {
+        try {
+          // Historical OHLC for HV and ATR
+          const historical = await yahooFinance.historical(ticker, {
+            period1: start.toISOString().slice(0, 10),
+            period2: end.toISOString().slice(0, 10),
+            interval: "1d",
+          }) as HistoricalResult;
+
+          if (!historical || historical.length < 5) {
+            results.push({
+              ticker, hv30: 0, atr14Pct: 0, ivProxy: "unavailable",
+              price: 0, verdict: "LOW", reason: "insufficient_data",
+            });
+            return;
+          }
+
+          const closes  = historical.map((d:any) => d.close);
+          const highs    = historical.map((d:any) => d.high);
+          const lows     = historical.map((d:any) => d.low);
+          const price    = closes[closes.length - 1];
+
+          const hv30    = computeHV30(closes.slice(-31));
+          const atr14Pct = computeATRPct(highs, lows, closes, price);
+
+          // IV proxy — options chain, nearest expiry ATM call
+          let ivProxy = "unavailable";
+          try {
+            const optionChain = await yahooFinance.options(ticker) as {
+            expirationDates?: Date[];
+            options?: Array<{
+              calls?: Array<{ strike?: number; impliedVolatility?: number }>;
+            }>;
+          };
+          const nearExpiry = optionChain.expirationDates?.[0];
+          if (nearExpiry) {
+            const chain = await yahooFinance.options(ticker, { date: nearExpiry }) as typeof optionChain;
+            const atmCall = chain.options?.[0]?.calls?.find(
+              (c) => Math.abs((c.strike ?? 0) - price) / price < 0.05
+            );
+            }
+          } catch {
+            // Options not available for this ticker — use "unavailable"
+          }
+
+          // Verdict
+          const verdict: "LOW" | "MEDIUM" | "HIGH" =
+            hv30 > 35 || atr14Pct > 2
+              ? "HIGH"
+              : hv30 > 15 || atr14Pct > 0.8
+                ? "MEDIUM"
+                : "LOW";
+
+          const reason =
+            verdict === "HIGH"   ? `HV30=${hv30.toFixed(1)}%, ATR14=${atr14Pct.toFixed(2)}%` :
+            verdict === "MEDIUM" ? `HV30=${hv30.toFixed(1)}%, ATR14=${atr14Pct.toFixed(2)}%` :
+                                   `HV30=${hv30.toFixed(1)}% and ATR14=${atr14Pct.toFixed(2)}% both low`;
+
+          results.push({ ticker, hv30, atr14Pct, ivProxy, price, verdict, reason });
+
+        } catch (err) {
+          logger.warn(`Volatility fetch failed for ${ticker}: ${err}`);
+          results.push({
+            ticker, hv30: 0, atr14Pct: 0, ivProxy: "error",
+            price: 0, verdict: "LOW", reason: `fetch_error: ${String(err)}`,
+          });
+        }
+      })
+    );
+
+    // ── Gate decision ─────────────────────────────────────────────────────────
+    const anyActive = results.some((r) => r.verdict !== "LOW");
+    const vixElevated = vixLevel > 20;
+    const gate: "PROCEED" | "SKIP" = (anyActive || vixElevated) ? "PROCEED" : "SKIP";
+
+    const highCount   = results.filter((r) => r.verdict === "HIGH").length;
+    const mediumCount = results.filter((r) => r.verdict === "MEDIUM").length;
+
+    return {
+      gate,
+      vixLevel:   parseFloat(vixLevel.toFixed(2)),
+      vixContext: vixLevel > 25 ? "HIGH" : vixLevel > 15 ? "ELEVATED" : "LOW",
+      summary:    `${highCount} HIGH, ${mediumCount} MEDIUM volatility ticker(s). VIX=${vixLevel.toFixed(1)}.`,
+      skipReason: gate === "SKIP"
+        ? "All tickers show low volatility and VIX < 20 — news unlikely to move prices."
+        : undefined,
+      results,
+    };
+  },
 
   // ── detect_tickers ────────────────────────────────────────────────────────
   // Reads from: public.stocks (ticker, company_name, sector, market_cap)
@@ -400,8 +722,8 @@ const toolImplementations: Record<string, (args: Record<string, unknown>) => Pro
   // Monthly limit: 500 tweets/month (Twitter Premium)
   // Daily limit:   50 tweets/day   (Twitter Premium)
   check_tweet_quota: async (_args: Record<string, unknown>) => {
-    const MONTHLY_LIMIT = 500;
-    const DAILY_LIMIT   = 50;
+    const MONTHLY_LIMIT = 180;  // 6/day × 30 days
+    const DAILY_LIMIT   = 6;    // max 6 main tweets per day — replies and quote tweets excluded
 
     const now        = new Date();
     const monthKey   = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
@@ -475,38 +797,24 @@ const toolImplementations: Record<string, (args: Record<string, unknown>) => Pro
   },
 
   // ── post_tweet ────────────────────────────────────────────────────────────
-  // Posts a tweet via Twitter API v2 with OAuth 1.0a signing (oauth-1.0a + axios).
-  //
-  // For tweet2 (quote-tweet): Gemini passes delay_minutes (3–12, randomised).
-  // The tool sleeps for that duration BEFORE posting — the delay happens
-  // server-side so no external scheduler is needed.
-  // ⚠️  NOTE: analyzeNews() blocks for the delay duration. Fine for a background
-  // worker — set your HTTP timeout accordingly if called via a web API.
-  //
-  // After a successful post, tweet_quota is incremented in Supabase.
+  // Posts a main tweet via Twitter API v2 with OAuth 1.0a signing.
+  // is_main_tweet=true → counts toward the 6/day quota.
+  // is_main_tweet=false (quote tweet) → does NOT count toward quota.
+  // quote_tweet_id → makes this a quote tweet of the referenced tweet.
   post_tweet: async (args: Record<string, unknown>) => {
-    const { text, quote_tweet_id, delay_minutes } = args as {
-      text:            string;
-      quote_tweet_id?: string;  // tweet1's Twitter ID — only present for tweet2
-      delay_minutes?:  number;  // Gemini chooses 3–12, randomised per call
+    const { text, quote_tweet_id, is_main_tweet } = args as {
+      text:             string;
+      quote_tweet_id?:  string;   // ID of tweet to quote — omit for main tweet
+      is_main_tweet?:   boolean;  // true = counts toward 6/day limit
     };
- 
-    // ── Optional delay before posting (tweet2 only) ────────────────────────
-    if (delay_minutes && delay_minutes > 0) {
-      logger.info(`⏳ Waiting ${delay_minutes} min before posting quote-tweet...`);
-      await new Promise<void>((resolve) =>
-        setTimeout(resolve, delay_minutes * 60 * 1000)
-      );
-    }
- 
-    // ── Sign request and post via axios ───────────────────────────────────
+
     const authHeader = twitterOAuth.toHeader(
       twitterOAuth.authorize({ url: TWEETS_URL, method: "POST" }, twitterToken)
     );
- 
-    const body: Record<string, string> = { text };
+
+    const body: Record<string, unknown> = { text };
     if (quote_tweet_id) body.quote_tweet_id = quote_tweet_id;
- 
+
     let tweetId: string;
     try {
       const response = await axios.post(TWEETS_URL, body, {
@@ -516,58 +824,194 @@ const toolImplementations: Record<string, (args: Record<string, unknown>) => Pro
           Accept:         "application/json",
         },
       });
- 
       tweetId = response.data.data.id as string;
     } catch (err: unknown) {
       const reason = axios.isAxiosError(err)
         ? `${err.response?.status} ${JSON.stringify(err.response?.data)}`
         : String(err);
       logger.error(`Twitter post error: ${reason}`);
-      return { posted: false, reason, delayMinutes: delay_minutes ?? 0 };
+      return { posted: false, reason };
     }
- 
+
     const tweetUrl = `https://twitter.com/i/web/status/${tweetId}`;
     logger.info(`✅ Tweet posted: ${tweetUrl}`);
- 
-    // ── Update tweet_quota in Supabase ─────────────────────────────────────
-    // Fetch current row first so we can increment atomically without a DB func.
-    const now      = new Date();
-    const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-    const todayKey = now.toISOString().slice(0, 10);  // "YYYY-MM-DD"
- 
-    const { data: currentQuota } = await supabase
-      .from("tweet_quota")
-      .select("tweets_sent, last_tweet_date, daily_tweets_sent")
-      .eq("month", monthKey)
-      .maybeSingle();
- 
-    const isNewDay         = currentQuota?.last_tweet_date !== todayKey;
-    const newMonthlyTotal  = (currentQuota?.tweets_sent       ?? 0) + 1;
-    const newDailyTotal    = isNewDay
-      ? 1
-      : (currentQuota?.daily_tweets_sent ?? 0) + 1;
- 
-    const { error: quotaErr } = await supabase
-      .from("tweet_quota")
-      .upsert(
-        {
-          month:             monthKey,
-          tweets_sent:       newMonthlyTotal,
-          last_tweet_date:   todayKey,
-          daily_tweets_sent: newDailyTotal,
-          updated_at:        now.toISOString(),
-        },
-        { onConflict: "month" }
-      );
- 
-    if (quotaErr) logger.warn(`tweet_quota update error: ${quotaErr.message}`);
- 
-    return {
-      posted:       true,
-      tweetId,
-      tweetUrl,
-      delayMinutes: delay_minutes ?? 0,
+
+    // Auto-like immediately — fire and forget, never blocks the pipeline
+    likeTweet(tweetId);
+
+    // Only update quota for main tweets — replies and quote tweets excluded
+    if (is_main_tweet) {
+      const now      = new Date();
+      const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+      const todayKey = now.toISOString().slice(0, 10);
+
+      const { data: currentQuota } = await supabase
+        .from("tweet_quota")
+        .select("tweets_sent, last_tweet_date, daily_tweets_sent")
+        .eq("month", monthKey)
+        .maybeSingle();
+
+      const isNewDay        = currentQuota?.last_tweet_date !== todayKey;
+      const newMonthlyTotal = (currentQuota?.tweets_sent     ?? 0) + 1;
+      const newDailyTotal   = isNewDay ? 1 : (currentQuota?.daily_tweets_sent ?? 0) + 1;
+
+      const { error: quotaErr } = await supabase
+        .from("tweet_quota")
+        .upsert(
+          { month: monthKey, tweets_sent: newMonthlyTotal,
+            last_tweet_date: todayKey, daily_tweets_sent: newDailyTotal,
+            updated_at: now.toISOString() },
+          { onConflict: "month" }
+        );
+
+      if (quotaErr) logger.warn(`tweet_quota update error: ${quotaErr.message}`);
+    }
+
+    return { posted: true, tweetId, tweetUrl };
+  },
+
+  // ── post_reply ────────────────────────────────────────────────────────────
+  // Posts a reply to a tweet. Used to post the article URL as the first
+  // reply to the main tweet — keeps the main tweet clean (plain text only).
+  // Does NOT count toward the daily quota.
+  post_reply: async (args: Record<string, unknown>) => {
+    const { text, reply_to_tweet_id } = args as {
+      text:               string;
+      reply_to_tweet_id:  string;  // ID of the tweet to reply to
     };
+
+    const authHeader = twitterOAuth.toHeader(
+      twitterOAuth.authorize({ url: TWEETS_URL, method: "POST" }, twitterToken)
+    );
+
+    let tweetId: string;
+    try {
+      const response = await axios.post(
+        TWEETS_URL,
+        { text, reply: { in_reply_to_tweet_id: reply_to_tweet_id } },
+        {
+          headers: {
+            Authorization:  authHeader["Authorization"],
+            "Content-Type": "application/json",
+            Accept:         "application/json",
+          },
+        }
+      );
+      tweetId = response.data.data.id as string;
+    } catch (err: unknown) {
+      const reason = axios.isAxiosError(err)
+        ? `${err.response?.status} ${JSON.stringify(err.response?.data)}`
+        : String(err);
+      logger.error(`Twitter reply error: ${reason}`);
+      return { posted: false, reason };
+    }
+
+    const replyUrl = `https://twitter.com/i/web/status/${tweetId}`;
+    logger.info(`✅ Reply posted: ${replyUrl}`);
+
+    // Auto-like immediately — fire and forget
+    likeTweet(tweetId);
+
+    return { posted: true, tweetId, replyUrl };
+  },
+
+  // ── check_tweet_metrics ───────────────────────────────────────────────────
+  // Waits 20 minutes then fetches impression count for the main tweet.
+  // Uses non_public_metrics which requires OAuth 1.0a user context — only
+  // works for tweets owned by the authenticated account.
+  // Returns { impressions, meetsThreshold } where threshold is 100.
+  check_tweet_metrics: async (args: Record<string, unknown>) => {
+    const { tweet_id } = args as { tweet_id: string };
+    const IMPRESSION_THRESHOLD = 100;
+    const WAIT_MINUTES         = 20;
+
+    logger.info(`⏳ Waiting ${WAIT_MINUTES} min before checking tweet metrics...`);
+    await new Promise<void>((resolve) =>
+      setTimeout(resolve, WAIT_MINUTES * 60 * 1000)
+    );
+
+    const metricsUrl = `https://api.twitter.com/2/tweets/${tweet_id}?tweet.fields=non_public_metrics`;
+    const authHeader = twitterOAuth.toHeader(
+      twitterOAuth.authorize({ url: metricsUrl, method: "GET" }, twitterToken)
+    );
+
+    try {
+      const response = await axios.get(metricsUrl, {
+        headers: {
+          Authorization: authHeader["Authorization"],
+          Accept:        "application/json",
+        },
+      });
+
+      const impressions: number =
+        response.data?.data?.non_public_metrics?.impression_count ?? 0;
+
+      logger.info(
+        `📊 Tweet ${tweet_id} — ${impressions} impressions after ${WAIT_MINUTES} min ` +
+        `(threshold: ${IMPRESSION_THRESHOLD})`
+      );
+
+      return {
+        impressions,
+        meetsThreshold: impressions >= IMPRESSION_THRESHOLD,
+        threshold:      IMPRESSION_THRESHOLD,
+        waitMinutes:    WAIT_MINUTES,
+      };
+    } catch (err: unknown) {
+      const reason = axios.isAxiosError(err)
+        ? `${err.response?.status} ${JSON.stringify(err.response?.data)}`
+        : String(err);
+      logger.error(`Metrics fetch error: ${reason}`);
+      // Fail open — if metrics are unavailable, do not post quote tweet
+      return { impressions: 0, meetsThreshold: false, reason };
+    }
+  },
+
+  // ── like_tweet ────────────────────────────────────────────────────────────
+  // Likes a tweet on behalf of the authenticated account.
+  // Called automatically after every successful post — main tweet, reply,
+  // and quote tweet. Liking your own posts signals engagement to the Twitter
+  // algorithm and improves initial reach.
+  //
+  // Endpoint: POST /2/users/:userId/likes
+  // Requires: tweet.write + like.write OAuth 1.0a user context scopes.
+  // userId must be the numeric Twitter user ID of the authenticated account —
+  // set TWITTER_USER_ID in your .env.
+  like_tweet: async (args: Record<string, unknown>) => {
+    const { tweet_id } = args as { tweet_id: string };
+
+    if (!config.twitter_user_id) {
+      logger.warn("TWITTER_USER_ID not set — skipping auto-like");
+      return { liked: false, reason: "TWITTER_USER_ID not configured" };
+    }
+
+    const likeUrl = `https://api.twitter.com/2/users/${config.twitter_user_id}/likes`;
+    const authHeader = twitterOAuth.toHeader(
+      twitterOAuth.authorize({ url: likeUrl, method: "POST" }, twitterToken)
+    );
+
+    try {
+      await axios.post(
+        likeUrl,
+        { tweet_id },
+        {
+          headers: {
+            Authorization:  authHeader["Authorization"],
+            "Content-Type": "application/json",
+            Accept:         "application/json",
+          },
+        }
+      );
+      logger.info(`❤️  Liked tweet: ${tweet_id}`);
+      return { liked: true, tweetId: tweet_id };
+    } catch (err: unknown) {
+      const reason = axios.isAxiosError(err)
+        ? `${err.response?.status} ${JSON.stringify(err.response?.data)}`
+        : String(err);
+      logger.warn(`Auto-like failed for ${tweet_id}: ${reason}`);
+      // Fail silently — a failed like must never crash the pipeline
+      return { liked: false, reason };
+    }
   },
 
   // ── save_analysis_result ──────────────────────────────────────────────────
@@ -680,6 +1124,27 @@ const toolImplementations: Record<string, (args: Record<string, unknown>) => Pro
 const tools: Tool = {
   functionDeclarations: [
     {
+      name: "scan_ticker_volatility",
+      description:
+        "Fetches volatility metrics for tickers from Yahoo Finance and returns a gate decision. " +
+        "MUST be called first in STEP 1 before detect_tickers. " +
+        "If gate=SKIP: set signalQuality=LOW, skip all remaining steps except STEP 8. " +
+        "Returns per-ticker HV30, ATR14%, IV proxy, VIX level, and gate: PROCEED | SKIP.",
+      parameters: {
+        type: Type.OBJECT,
+        properties: {
+          tickers: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description:
+              "Tickers to scan. Use candidateTickers from metadata as starting point. " +
+              "Include the most likely affected tickers based on the news headline.",
+          },
+        },
+        required: ["tickers"],
+      },
+    },
+    {
       name: "detect_tickers",
       description:
         "Detect stock tickers by querying the stocks table in two phases: " +
@@ -782,83 +1247,87 @@ const tools: Tool = {
     {
       name: "post_tweet",
       description:
-        "Post a tweet via the Twitter API v2 (OAuth 2.0 user context). " +
-        "Call once for tweet1 (no quote_tweet_id, no delay). " +
-        "Call again for tweet2 only if you decide the content will perform well — " +
-        "pass the tweet1 tweetId as quote_tweet_id and choose a random delay_minutes between 3 and 12. " +
-        "The tool waits the delay before posting and updates tweet_quota in the DB after success. " +
-        "Returns { posted, tweetId, tweetUrl } on success or { posted: false, reason } on failure.",
+        "Post the main tweet — plain text only, no link. " +
+        "Pass is_main_tweet=true so it counts toward the 6/day quota. " +
+        "Returns { posted, tweetId, tweetUrl }.",
       parameters: {
         type: Type.OBJECT,
         properties: {
-          text: {
+          text:          { type: Type.STRING,  description: "Plain text tweet content. No links, no formatting." },
+          is_main_tweet: { type: Type.BOOLEAN, description: "Always true for the main tweet." },
+        },
+        required: ["text", "is_main_tweet"],
+      },
+    },
+    {
+      name: "post_reply",
+      description:
+        "Post a reply to the main tweet containing only the article URL. " +
+        "Call immediately after post_tweet succeeds. " +
+        "Does NOT count toward the daily quota. " +
+        "Returns { posted, tweetId, replyUrl }.",
+      parameters: {
+        type: Type.OBJECT,
+        properties: {
+          text:               { type: Type.STRING, description: "The article URL — nothing else." },
+          reply_to_tweet_id:  { type: Type.STRING, description: "tweetId from the main tweet post_tweet result." },
+        },
+        required: ["text", "reply_to_tweet_id"],
+      },
+    },
+    {
+      name: "check_tweet_metrics",
+      description:
+        "Waits 20 minutes then fetches impression count for the main tweet. " +
+        "Returns { impressions, meetsThreshold } where threshold is 100. " +
+        "Call this after post_reply. If meetsThreshold=true, post the quote tweet. " +
+        "If meetsThreshold=false or metrics unavailable, skip the quote tweet entirely.",
+      parameters: {
+        type: Type.OBJECT,
+        properties: {
+          tweet_id: { type: Type.STRING, description: "tweetId from the main tweet post_tweet result." },
+        },
+        required: ["tweet_id"],
+      },
+    },
+    {
+      name: "like_tweet",
+      description:
+        "Automatically likes a tweet posted by this account. " +
+        "Call after EVERY successful post — main tweet, reply, and quote tweet. " +
+        "Liking your own posts signals engagement to the Twitter algorithm and " +
+        "increases the chance of early distribution. " +
+        "Fails silently — a failed like must never block the pipeline. " +
+        "Returns { liked: boolean, tweetId }.",
+      parameters: {
+        type: Type.OBJECT,
+        properties: {
+          tweet_id: {
             type: Type.STRING,
-            description: "The full tweet text to post.",
-          },
-          quote_tweet_id: {
-            type: Type.STRING,
-            description:
-              "The tweetId of tweet1. Only provide this when posting tweet2 as a quote-tweet. " +
-              "Omit entirely when posting tweet1.",
-          },
-          delay_minutes: {
-            type: Type.NUMBER,
-            description:
-              "Minutes to wait before posting. Only used for tweet2. " +
-              "Choose a random value between 3 and 12 — vary it each time to avoid pattern detection. " +
-              "Omit when posting tweet1.",
+            description: "The tweetId of the tweet to like.",
           },
         },
-        required: ["text"],
+        required: ["tweet_id"],
       },
     },
     {
       name: "save_analysis_result",
-      description:
-        "Persist the completed analysis to analysis_results AND write all contradiction/alignment " +
-        "article pairs to article_relationships. MUST be called as the final step. " +
-        "Pass tweet1 as the tweet to store — tweet2 is NOT stored in the DB.",
+      description: "Persist analysis to analysis_results and article_relationships. MUST be called last.",
       parameters: {
         type: Type.OBJECT,
         properties: {
-          articleId:           { type: Type.STRING, description: "Supabase UUID from save_news_to_database." },
-          affectedTickers:     { type: Type.ARRAY, items: { type: Type.STRING }, description: "All affected tickers." },
-          newTickersInserted:  { type: Type.ARRAY, items: { type: Type.STRING }, description: "Tickers added to stocks table this run." },
-          contradiction: {
-            type: Type.OBJECT,
-            description: "Contradiction result, or omit if none.",
-            properties: {
-              score:   { type: Type.NUMBER },
-              label:   { type: Type.STRING },
-              summary: { type: Type.STRING },
-            },
-          },
-          alignment: {
-            type: Type.OBJECT,
-            description: "Alignment result, or omit if none.",
-            properties: {
-              score:              { type: Type.NUMBER },
-              label:              { type: Type.STRING },
-              summary:            { type: Type.STRING },
-              boostedImpactScore: { type: Type.NUMBER },
-            },
-          },
-          marketImpact: {
-            type: Type.OBJECT,
-            description: "Market impact prediction.",
-            properties: {
-              prediction: { type: Type.STRING },
-              confidence: { type: Type.NUMBER },
-              reasoning:  { type: Type.STRING },
-            },
-            required: ["prediction", "confidence", "reasoning"],
-          },
-          tweet1:              { type: Type.STRING,  description: "The data/analysis tweet. Stored in analysis_results.tweet." },
-          relatedArticleIds:   { type: Type.ARRAY, items: { type: Type.STRING }, description: "UUIDs of contradicting or aligning articles for article_relationships." },
-          relationshipType:    { type: Type.STRING,  description: "'contradiction' or 'alignment'. Null if neither." },
-          relationshipScore:   { type: Type.NUMBER,  description: "Score (0–100) for the relationship." },
-          relationshipLabel:   { type: Type.STRING,  description: "Label: Low/Medium/High/Critical." },
-          relationshipSummary: { type: Type.STRING,  description: "Summary of the relationship." },
+          articleId:           { type: Type.STRING },
+          affectedTickers:     { type: Type.ARRAY, items: { type: Type.STRING } },
+          newTickersInserted:  { type: Type.ARRAY, items: { type: Type.STRING } },
+          contradiction:       { type: Type.OBJECT, properties: { score: { type: Type.NUMBER }, label: { type: Type.STRING }, summary: { type: Type.STRING } } },
+          alignment:           { type: Type.OBJECT, properties: { score: { type: Type.NUMBER }, label: { type: Type.STRING }, summary: { type: Type.STRING }, boostedImpactScore: { type: Type.NUMBER } } },
+          marketImpact:        { type: Type.OBJECT, properties: { prediction: { type: Type.STRING }, confidence: { type: Type.NUMBER }, reasoning: { type: Type.STRING } }, required: ["prediction","confidence","reasoning"] },
+          tweet1:              { type: Type.STRING },
+          relatedArticleIds:   { type: Type.ARRAY, items: { type: Type.STRING } },
+          relationshipType:    { type: Type.STRING },
+          relationshipScore:   { type: Type.NUMBER },
+          relationshipLabel:   { type: Type.STRING },
+          relationshipSummary: { type: Type.STRING },
         },
         required: ["articleId", "affectedTickers", "newTickersInserted", "marketImpact", "tweet1", "relatedArticleIds"],
       },
@@ -871,433 +1340,291 @@ const tools: Tool = {
 // ─────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `
-You are a financial news analysis engine with access to EIGHT tools. Follow this exact workflow:
- 
-STEP 1 — TICKER DETECTION (DB-backed)
-Call detect_tickers with the news headline and body.
-Combines two phases: token scan + company-name scan against the stocks table.
-Result includes "confirmedFromDB" — verified StockRecord objects { ticker, company_name, sector, market_cap }.
- 
-For each ticker you infer from context (subsidiaries, brands, executives) NOT in confirmedFromDB:
-  → Call insert_ticker to add it to the stocks table.
-  → Include it in affectedTickers after insert returns { inserted: true }.
- 
-── TICKER RANKING — KEEP THE TOP 5 ONLY ──────────────────────────────────────
-After collecting all confirmed and inferred tickers, rank them by market relevance
-and keep only the 5 most directly affected. Do NOT include every ticker mentioned
-in passing — only those whose price, valuation, or business model is materially
-impacted by this specific news event.
- 
-Ranking criteria (highest to lowest priority):
-  1. Company is the direct subject of the news (earnings, deal, legal action, CEO change)
-  2. Company is a named counterparty (merger target, major customer, direct competitor)
-  3. Company operates in the same sector and would move sympathetically
-  4. Broad market proxies (SPY, QQQ, VIX) — only include if the news is macro-level
-  5. Tangentially related companies — EXCLUDE these entirely
- 
-If fewer than 5 tickers are genuinely relevant, use fewer — do not pad to 5.
-affectedTickers must contain only the final ranked list of up to 5 tickers.
-Collect newly inserted ones separately as newTickersInserted[].
- 
+You are a financial news analysis engine with access to ELEVEN tools.
+
+PRE-COMPUTED VALUES (read from metadata — do not recompute):
+  metadata.candidateTickers      — Phase 1 ticker candidates
+  metadata.articleAgeHours       — article age in hours
+  metadata.isRepeatSubject       — true if same subject covered in last 24h
+  metadata.repeatSubjectTickers  — which tickers triggered the repeat flag
+  metadata.roughRelevanceFloor   — minimum possible relevance score
+  metadata.corroboratingSourceCount
+  metadata.corroboratingSources
+  metadata.isMultiSourceStory
+
+STEP 1 — VOLATILITY SCAN + TICKER DETECTION
+
+── STEP 1A: VOLATILITY SCAN (always run first) ─────────────────────────────────
+Call scan_ticker_volatility with candidateTickers from metadata.
+If candidateTickers is empty, infer 2–3 tickers from the headline using the
+MACRO PROXY MAPPING below before calling.
+
+If gate = SKIP:
+  The market is too quiet for this news to be tradeable.
+  Set signalQuality="LOW", relevanceScore=0.
+  Skip all steps except STEP 8. mainTweet="", replyTweet="", quoteTweet="".
+
+If gate = PROCEED:
+  Apply volatility boost/penalty to relevanceScore in STEP 6.5:
+    Any HIGH volatility ticker  → +10
+    VIX > 25                    → +10
+    VIX 15–25                   → +5
+    All LOW but VIX saved gate  → -5
+  Continue to STEP 1B.
+
+── STEP 1B: TICKER DETECTION ───────────────────────────────────────────────────
+Call detect_tickers with headline and body.
+candidateTickers from metadata is Phase 1 already done.
+For tickers inferred from context not returned: call insert_ticker first.
+
+TICKER RANKING — TOP 5 ONLY:
+  1. Direct subject of the news (earnings, deal, legal, CEO change)
+  2. Named counterparty (merger target, major customer, competitor)
+  3. Same-sector sympathy move
+  4. Macro proxies — see mapping below
+  5. Tangential mentions — EXCLUDE
+Use fewer than 5 if not genuinely relevant. Never pad.
+Store newly inserted in newTickersInserted[].
+
+MACRO PROXY MAPPING — use MACRO_PROXIES constant (defined in code) for macro news.
+Never leave affectedTickers empty when making a trade signal.
+If the macro category is not in the constant, infer the most liquid ETF proxy.
+
 STEP 2 — DATABASE CHECK
-Call check_news_in_database using the news ID and headline.
- 
-STEP 3a — IF ARTICLE EXISTS:
-  Set alreadyInDatabase = true. Record its UUID as articleDbId. Skip to STEP 6.
- 
-STEP 3b — IF ARTICLE DOES NOT EXIST:
-  Call save_news_to_database with the NewsObject and all tickers.
-  It returns { saved: true, articleId: "<uuid>" }.
-  Store that UUID as articleDbId — required for STEP 8.
-  Then call fetch_related_news with tickers and articleDbId as excludeId.
- 
-IMPORTANT: Articles returned by fetch_related_news have fields:
-    { id, title, content, source, url, published_at, tickers }
-    Use 'title' where you would expect 'headline', and 'content' where you would expect 'body'.
- 
+Call check_news_in_database. URL uniqueness already verified before this run.
+
+STEP 3a — EXISTS: alreadyInDatabase=true, record articleDbId, skip to STEP 6.
+STEP 3b — NEW: save_news_to_database → articleDbId → fetch_related_news.
+fetch_related_news returns { id, title, content, source, url, published_at, tickers }.
+
 STEP 4 — CONTRADICTION ANALYSIS
-Identify fetched articles that CONTRADICT the current news.
-Score 0–100:
-  0–24 → Low | 25–49 → Medium | 50–74 → High | 75–100 → Critical
- 
-Collect contradicting article UUIDs into relatedArticleIds[].
-If contradictionScore > 0: populate contradiction, set alignment to null.
- 
+Score 0–100 (0–24 Low, 25–49 Medium, 50–74 High, 75–100 Critical).
+If contradictionScore > 0: populate contradiction, alignment=null.
+
 STEP 5 — ALIGNMENT ANALYSIS (only if contradictionScore == 0)
-Find articles that ALIGN with the current news.
-Score 0–100 using the same scale.
-Collect aligning article UUIDs into relatedArticleIds[].
-boostedImpactScore = base confidence + (alignmentScore x 0.25), capped at 100.
- 
+Score 0–100. boostedImpactScore = confidence + (alignmentScore x 0.25), cap 100.
+
+CORROBORATING SOURCES — from metadata:
+Confidence boost: +8 for 2 sources, +15 for 3, +20 for 4+. Cap 100.
+State: "Confidence boosted: X sources reporting."
+
 STEP 6 — MARKET IMPACT PREDICTION
 prediction: "buy" | "sell" | "hold" | "neutral"
-confidence: 0–100
-reasoning: 1–2 sentences grounded in the news
- 
-STEP 6.5 — SIGNAL QUALITY GATE
-Before generating tweets, evaluate whether this news is worth posting about at all.
-This is a separate decision from the tweet2 algo decision — it governs tweet1 too.
- 
-Set signalQuality to "HIGH", "MEDIUM", or "LOW" based on the following:
- 
-  HIGH — post tweet1 AND run tweet2 algo decision normally:
-  - prediction is "buy" or "sell" AND confidence >= 70
-  - OR contradiction score >= 50 (High or Critical)
-  - OR corroboratingSourceCount >= 3
-  - OR the news contains a concrete, specific data point (earnings number,
-    rate decision, M&A deal size, regulatory ruling, price move >= 5%)
- 
-  MEDIUM — post tweet1 only, skip tweet2 entirely:
-  - prediction is "buy" or "sell" AND confidence 50–64
-  - OR alignment score >= 50 AND confidence >= 55
-  - OR corroboratingSourceCount == 2
-  - OR news is macro-relevant but lacks a specific data point
- 
-  LOW — skip ALL tweet posting, still save analysis:
-  - prediction is "hold" or "neutral" AND confidence < 50
-  - OR the news is a rumour, speculation, or opinion piece with no hard data
-  - OR the news is more than 6 hours old AND corroboratingSourceCount == 1
-  - OR the news adds nothing new to a story already posted about this cycle
- 
-If signalQuality is LOW: set tweet1 = "", tweet2 = "", skip to STEP 8.
-If signalQuality is MEDIUM: generate tweet1, set tweet2 = "", skip tweet2 posting.
-If signalQuality is HIGH: generate both tweets, run tweet2 algo decision normally.
- 
-Include signalQuality in the final JSON output.
- 
-── REPEAT SUBJECT CHECK ───────────────────────────────────────────────────────
-Look at the relatedArticleIds collected in STEP 4 or STEP 5.
-If ANY of those related articles already have a tweet posted about them
-(i.e. they appeared in fetch_related_news and share 2+ tickers with this article),
-this subject has already been covered recently. In that case:
-  - If the current news adds a NEW concrete data point not in the related articles
-    → treat as HIGH and post with a clear "UPDATE:" framing in the tweet
-  - If the current news is essentially the same story rehashed
-    → downgrade signalQuality to LOW and skip posting
- 
-CORROBORATING SOURCES SIGNAL (read metadata before STEP 6 and STEP 7)
-The news object may contain these fields in metadata:
-  - corroboratingSourceCount  — number of platforms reporting this same story
-  - corroboratingSources      — list of source names (e.g. ["BBC", "Reuters", "Bloomberg"])
-  - isMultiSourceStory        — true when count >= 2
- 
-Use this signal as follows:
- 
-  MARKET CONFIDENCE BOOST (apply in STEP 6):
-  - 1 source  → no adjustment — use your base confidence
-  - 2 sources → add +8 to confidence (capped at 100)
-  - 3 sources → add +15 to confidence (capped at 100)
-  - 4+ sources → add +20 to confidence (capped at 100)
-  Include the boost in your reasoning: "Confidence boosted: X platforms reporting."
- 
-  TWEET2 ALGO DECISION (apply in STEP 7):
-  - 3+ sources reporting → near-certain POST regardless of other signals
-  - 2 sources reporting  → counts as a strong POST signal on its own
-  - 1 source             → use the normal algo decision criteria
- 
-  TWEET2 CONTENT (when isMultiSourceStory is true):
-  Cross-platform coverage is one of the strongest engagement signals you can use.
-  People share things that feel like consensus reality — when multiple major outlets
-  are all saying the same thing, it creates urgency and FOMO.
-  Weave the source count into tweet2 naturally. Examples:
-    - "BBC, Reuters AND Bloomberg are all reporting this."
-    - "When X platforms break the same story simultaneously, pay attention."
-    - "This isn't one outlet. This is [source1], [source2], [source3] — all at once."
-  Do NOT just list sources mechanically. Frame it as a signal.
- 
+confidence: 0–100 (apply corroboration boost)
+reasoning: 1–2 sentences
+
+STEP 6.5 — RELEVANCE SCORING + POSTING DECISION
+
+If metadata.isRepeatSubject=true:
+  → isRepeatSubject=true, relevanceScore=0, signalQuality="LOW"
+  → STEP 8 only. Skip STEP 7 and STEP 9.
+
+Otherwise, build relevanceScore starting from metadata.roughRelevanceFloor:
+  +25  Concrete data point: earnings figure, rate bps, deal size, ruling, price move >= 5%
+  +20  "buy"/"sell" AND confidence >= 70
+  +15  contradiction >= 50
+  +10  High-profile tickers: AAPL, TSLA, NVDA, MSFT, AMZN, GOOGL, META, BTC, ETH, SPY, QQQ
+  -20  Rumour/speculation/opinion with no verifiable data
+  -15  "hold"/"neutral" AND confidence < 50
+  Cap at 100, floor at 0.
+
+HARD RULE: if affectedTickers is empty → return to STEP 1 and resolve macro proxies.
+A trade signal without tickers is not actionable and must not be posted.
+
+REPEAT SUBJECT OVERRIDE (from relatedArticleIds):
+  New data point not in related articles → keep signalQuality, add "UPDATE:" to tweet
+  Same story rehashed → downgrade to LOW
+
+POSTING THRESHOLDS:
+  relevanceScore >= 80 → signalQuality="HIGH"   (post main tweet + quote if performance met)
+  relevanceScore 70–79 → signalQuality="MEDIUM" (post main tweet only)
+  relevanceScore < 70  → signalQuality="LOW"    (save analysis, no tweets)
+
 STEP 7 — TWEET GENERATION
- 
-If signalQuality is LOW: tweet1 = "", tweet2 = "". Skip to STEP 8.
-If signalQuality is MEDIUM: generate tweet1 only, tweet2 = "". Skip tweet2 posting.
-If signalQuality is HIGH: generate both tweets below.
- 
-Before writing any tweets, call check_tweet_quota.
-  If { allowed: false }: set tweet1 and tweet2 to empty strings. Skip to STEP 8.
-  If { allowed: true }: proceed to generate tweets based on signalQuality above.
- 
-You have Twitter Premium — there is NO character limit. Write as much as needed.
-Use signal emojis naturally: 📈 (bullish/buy), 📉 (bearish/sell), ⚡ (breaking/high impact), ⚠️ (contradiction/risk).
-Let tone, length, and style emerge from the content — do not follow a rigid template.
- 
-── TWEET 1 — Data & Analysis (main post) ──────────────────────────────────────
-Purpose: A complete market briefing that stands alone. Every line earns its place.
- 
-STRUCTURE — short punchy sentences, one point per line, blank line between sections:
- 
-Line 1: Signal opener — ALL CAPS signal word + ticker + what happened
-  Examples:
-    "⚡ BREAKING: $NVDA crushes Q3 — $35.1B revenue vs $33.2B expected"
-    "📉 SELL SIGNAL: $SPY hits new 2026 low as stagflation fears mount"
-    "⚠️ CONTRADICTION: $AAPL guidance conflicts with supply chain reports"
- 
-[blank line]
- 
-Lines 2–4: Key data points — one fact per line, numbers in full
-  - Use exact figures: +5.7%, $94.9B, 112% YoY — never round or simplify
-  - Lead each line with the most important number
-  - Bold the most critical figure using *asterisks*: "*$103/barrel* — first time since 2022"
- 
-[blank line]
- 
-SIGNAL: [prediction in ALL CAPS] | Confidence: [score]%
-VERDICT: [1 sentence — what this means for the market right now]
- 
-[blank line]
- 
-If contradiction or alignment exists:
-  ⚠️ CONTRADICTION ([label]): [one line summary]
-  OR
-  ✅ ALIGNMENT ([label]): [one line summary]
- 
-[blank line]
- 
-SOURCE: [source name] | [URL]
-[hashtags on final line]
- 
-FORMATTING RULES for tweet1:
-- Signal word always ALL CAPS: BREAKING, BUY, SELL, HOLD, EARNINGS, MERGER, RATE DECISION
-- Section labels always present: SIGNAL: / VERDICT: / SOURCE:
-- Numbers and percentages always in full — never "nearly 6%", always "+5.7%"
-- Maximum 6–8 lines total — dense but not overwhelming
-- No filler phrases: "it is worth noting", "importantly", "analysts say"
- 
-── TWEET 2 — Engagement Driver (quote-tweet of tweet1) ────────────────────────
-Purpose: Stop the scroll and pull people into tweet1. 2–3 sentences maximum.
-This is a hook, not an analysis. Every word serves one goal: make them click.
- 
-STRUCTURE — hybrid prose opening followed by bullet points:
- 
-Sentence 1 (prose): The bold hook — a counterintuitive statement, a sharp question,
-or a tension that demands resolution. This is the line people retweet.
-  Examples:
-    "The market is treating this like noise. It isn't."
-    "Who's on the wrong side of this $NVDA trade right now?"
-    "3 major outlets reporting the same thing simultaneously — that's not coincidence."
- 
-[blank line]
- 
-Bullet points (1–2 max): The sharpest supporting signals that back the hook
-  • [one concrete signal — number, name, or fact]
-  • [optional second signal — only if it adds something genuinely new]
- 
-[blank line]
- 
-Final line (prose): CTA that pulls toward tweet1
-   "Full breakdown below ↓" / "Read the signal ↓" / "Full analysis ↓"
-  Include $TICKER and relevant hashtags on this line
- 
-FORMATTING RULES for tweet2:
-- Prose hook must be 1 sentence — no run-ons
-- Bullet points use • character, not dashes
-- Tickers in $TICKER format always present
-- NO section labels (SIGNAL: / VERDICT:) — this is conversational, not analytical
-- NO ALL CAPS in tweet2 except ticker symbols — the hook works through directness, not shouting
-- Total length: hook + bullets + CTA — never longer than that
- 
-── ALGORITHM DECISION: IS TWEET 2 WORTH POSTING? ────────────────────────────
-The question is not "do I have something to say?" — it is
-"will this quote-tweet meaningfully amplify tweet1's reach?"
- 
-Post tweet2 if ANY of these are true:
-  - Prediction is "buy" or "sell" AND confidence > 70 — directional conviction
-    gets retweeted; wishy-washy calls do not
-  - Contradiction score is High or Critical — conflict and disagreement in markets
-    drives replies, quote-tweets and impressions faster than anything else
-  - News is less than 2 hours old — recency is the single biggest algorithm boost;
-    being early on a story compounds reach
-  - Affected tickers include high-profile names (AAPL, TSLA, NVDA, MSFT, AMZN,
-    GOOGL, META, BTC, ETH, SPY, QQQ) — large existing audiences = faster spread
-  - Alignment score is High or Critical AND confidence > 65 — multiple sources
-    pointing the same way signals a real move; traders share confirmation
-  - corroboratingSourceCount >= 2 — when multiple platforms are reporting the same
-    story it is consensus signal; audiences respond strongly to "everyone is saying this"
-  - corroboratingSourceCount >= 3 — near-certain POST; this is the strongest
-    real-time signal you can have that a story matters to the market
- 
-Skip tweet2 if ALL of the following are true:
-  - Prediction is "hold" or "neutral" AND confidence < 50
-  - News is more than 6 hours old
-  - No contradiction or alignment signal above Medium
-  - Tickers are low-profile with limited retail or institutional following
- 
-Write your honest reasoning in tweet2AlgoDecision. State which signals fired,
-which did not, and the specific conclusion: POST or SKIP.
- 
-STEP 8 — PERSIST ANALYSIS (MANDATORY — do not skip)
-Call save_analysis_result with:
-  - articleId: UUID from save_news_to_database (or the existing article UUID)
-  - affectedTickers, newTickersInserted
-  - contradiction (or null), alignment (or null)
-  - marketImpact
-  - tweet1 (stored in analysis_results.tweet — tweet2 is NOT stored)
-  - relatedArticleIds: UUIDs of all contradicting or aligning articles
-  - relationshipType: "contradiction" | "alignment" | null
-  - relationshipScore, relationshipLabel, relationshipSummary
- 
-This writes to both analysis_results and article_relationships.
- 
-⚠️  STEP 9 — TWEET POSTING (skip entirely if quota exhausted OR signalQuality is LOW)
- 
-If signalQuality is LOW: skip STEP 9 entirely.
-If signalQuality is MEDIUM: post tweet1 only — do NOT post tweet2.
-If signalQuality is HIGH: post tweet1, then run tweet2 algo decision normally.
- 
-CRITICAL: You MUST call post_tweet as a real tool call and wait for its response.
-You are STRICTLY FORBIDDEN from inventing, guessing, or fabricating ANY of the
-following: tweetId, tweetUrl, posted status, or any field inside tweet1PostResult
-or tweet2PostResult. These values DO NOT EXIST until the tool runs and returns them.
-Writing a fake tweetId like "1768400000000000001" will point to a non-existent tweet.
-If you write post results without calling the tool, the pipeline is broken.
- 
-── POST TWEET 1 ──────────────────────────────────────────────
-Call post_tweet with { text: tweet1 } only — no quote_tweet_id, no delay_minutes.
-WAIT for the tool response before doing anything else.
-Copy the EXACT values from the tool response into tweet1PostResult.
-Store response.tweetId as tweet1Id — you need it for tweet2.
- 
-── POST TWEET 2 (only if signalQuality is HIGH AND algo decision was POST) ────
-Choose a random delay between 3 and 12 minutes.
-Vary it each run — do not always pick the same value.
-Good examples: 4, 7, 11, 5, 9, 3, 12, 6. Pick freshly each time.
- 
-Call post_tweet with:
-  { text: tweet2, quote_tweet_id: tweet1Id, delay_minutes: <your_chosen_value> }
- 
-WAIT for the tool response. Copy the EXACT values it returns into tweet2PostResult.
- 
-If tweet1 failed to post (tweet1PostResult.posted === false), do NOT attempt tweet2.
-If you decided to skip tweet2, set tweet2PostResult to null.
- 
-IMPORTANT RULES:
-- Complete ALL steps before returning the final JSON.
-- Never skip check_tweet_quota before generating tweets.
-- Never skip save_analysis_result — analysis is not persisted without it.
-- NEVER fabricate tweetId, tweetUrl, or any post result — only use values the tool returned.
-- affectedTickers must contain a maximum of 5 tickers, ranked by relevance.
-- signalQuality must be set before any tweet is generated.
-- LOW quality signals save analysis but never post tweets.
-- Return ONLY valid JSON. No markdown fences. No preamble.
+Skip if isRepeatSubject=true OR relevanceScore < 70.
+Call check_tweet_quota. If allowed=false: mainTweet="", replyTweet="", quoteTweet="", skip to STEP 8.
+
+── MAIN TWEET ──────────────────────────────────────────────────────────────────
+Purpose: A high-quality trade signal backed by news sentiment.
+Format: Plain text only. No asterisks, no ALL CAPS labels, no bullet points,
+no SIGNAL:/VERDICT:/SOURCE: headers. Write like a smart analyst talking to
+a colleague — natural sentences, no Twitter formatting tricks.
+
+Structure:
+  Opening sentence: state what happened and what it means for the market.
+  Second sentence: the key number or data point that backs the signal.
+  Third sentence: the directional call — buy/sell/hold — with confidence and why.
+  Fourth sentence (optional): contradiction or alignment context if meaningful.
+  Final line: $TICKER tags and #hashtags only — no other text on this line.
+
+Rules:
+  - Tickers as $TICKER inline in the text AND on the final line
+  - Confidence score stated naturally: "with 78% confidence" not "Confidence: 78%"
+  - No article URL in this tweet — link goes in the reply
+  - Max 4–5 sentences before the ticker/hashtag line
+  - No filler: "it is worth noting", "importantly", "in conclusion"
+  - Not financial advice — add naturally at end if it fits
+
+Example for UK rates story:
+  The Bank of England is now expected to hold rates at 3.75% through mid-2026,
+  with markets pricing in a potential hike to 4.0% by June as oil above $100
+  feeds directly into UK inflation. This is a meaningful shift from the rate cut
+  cycle priced just weeks ago. Sell signal on UK equities with 70% confidence —
+  rising rates and geopolitical inflation pressure are a direct headwind for
+  margins and valuations. Worth watching closely.
+
+  $EWU $HSBA $LLOY $BARC #BankOfEngland #UKMarkets #RateDecision #Stagflation
+
+── REPLY TWEET (link only) ─────────────────────────────────────────────────────
+Content: The article URL and nothing else.
+This is the first reply to the main tweet — keeps the main tweet clean.
+replyTweet = the full article URL as a bare string.
+
+── QUOTE TWEET (HIGH signals only, posted based on 20min performance) ──────────
+Purpose: Engagement hook that pulls people into the main tweet.
+Format: 2–3 short sentences. No formatting. Conversational. No labels.
+
+Structure:
+  Hook sentence: counterintuitive statement, sharp question, or tension.
+  1–2 follow-up sentences: the sharpest signal or what makes this different.
+  Final sentence: directional pull — "Full breakdown below" with $TICKER and hashtags.
+
+Rules:
+  - No ALL CAPS except $TICKER
+  - No bullet points
+  - No article URL — the link is already in the reply
+  - Short and punchy — this is what gets retweeted
+
+ANTI-HALLUCINATION RULES — apply throughout every step:
+
+NUMBERS AND DATA:
+- Every figure in mainTweet and quoteTweet MUST appear verbatim in the article body.
+- Do NOT round, estimate, or paraphrase numbers. If the body says "$94.9B" write "$94.9B".
+- Do NOT extrapolate: "revenues grew 15% so next quarter could be..." is fabrication.
+- If no concrete number exists in the article, do not invent one to fill the tweet.
+- Confidence scores are your assessment of market direction — not invented statistics.
+
+TICKERS:
+- Only include tickers that were returned by detect_tickers, inserted via insert_ticker,
+  or are from the MACRO PROXY MAPPING table.
+- Do NOT invent ticker symbols. "UKBO", "BOEQ", "OILX" are not real tickers.
+- If you are unsure whether a symbol exists, call insert_ticker to verify — if it
+  fails the upsert, the ticker is invalid.
+
+MARKET PREDICTIONS:
+- prediction and confidence must be grounded in the article content.
+- Do NOT cite analyst forecasts, price targets, or external data not in the article body.
+- If the article is ambiguous, use "neutral" with low confidence — do not fabricate conviction.
+- reasoning must quote or directly reference a specific claim from the article.
+
+TWEET CONTENT:
+- Every factual claim in mainTweet must trace back to a sentence in the article body.
+- If you cannot point to the source sentence, remove the claim.
+- quoteTweet hooks must be based on the actual signal, not invented drama.
+- Do NOT write "analysts say", "markets expect", "sources suggest" unless the article
+  itself contains those exact claims from named sources.
+
+STEP 8 — PERSIST ANALYSIS (MANDATORY — always run, even for repeat subjects)
+Call save_analysis_result: articleId, affectedTickers, newTickersInserted,
+contradiction or null, alignment or null, marketImpact, mainTweet (stored as tweet),
+relatedArticleIds, relationshipType, relationshipScore, relationshipLabel, relationshipSummary.
+
+STEP 9 — TWEET POSTING
+Skip entirely if isRepeatSubject=true OR relevanceScore < 70.
+
+CRITICAL: NEVER fabricate any post result. Call each tool and WAIT for its response.
+Copy EXACT values returned — never invent tweetId, tweetUrl, or any field.
+
+── POST MAIN TWEET ─────────────────────────────────────────────────────────────
+Call post_tweet({ text: mainTweet, is_main_tweet: true }).
+Wait for response. Store tweetId as mainTweetId.
+
+── POST LINK REPLY ─────────────────────────────────────────────────────────────
+Call post_reply({ text: replyTweet, reply_to_tweet_id: mainTweetId }).
+Wait for response. Store result as replyPostResult.
+
+── CHECK PERFORMANCE (HIGH signals only) ────────────────────────────────────────
+If signalQuality="HIGH" AND mainTweet posted successfully:
+  Call check_tweet_metrics({ tweet_id: mainTweetId }).
+  The tool waits 20 minutes then returns { impressions, meetsThreshold }.
+  Store impressions as mainTweetImpressions.
+
+  If meetsThreshold=true (impressions > 100):
+    Call post_tweet({ text: quoteTweet, quote_tweet_id: mainTweetId, is_main_tweet: false }).
+    Store result as quoteTweetPostResult.
+  If meetsThreshold=false:
+    quoteTweetPostResult = null.
+
+If mainTweet failed to post: skip reply and quote tweet entirely.
+
+RULES:
+- Never skip check_tweet_quota or save_analysis_result.
+- affectedTickers: max 5, ranked. Never empty when making a trade signal.
+- isRepeatSubject=true → save always, post never.
+- relevanceScore < 70 → save only. 70–79 → main tweet only. >= 80 → main + performance-based quote.
+- Quote tweet only posts if impressions > 100 in 20 minutes — never post it unconditionally.
+- Every number in a tweet must exist verbatim in the article body — never invent figures.
+- Every ticker must be verified via detect_tickers or the MACRO PROXY MAPPING — never invent symbols.
+- Every factual claim must trace to a specific sentence in the article body — no extrapolation.
+- Return ONLY valid JSON. No markdown. No preamble.
 {
-  "newsId": string,
-  "articleDbId": string,
-  "alreadyInDatabase": boolean,
-  "affectedTickers": string[],
-  "newTickersInserted": string[],
-  "signalQuality": "HIGH" | "MEDIUM" | "LOW",
-  "contradiction": {
-    "score": number,
-    "label": "Low"|"Medium"|"High"|"Critical",
-    "contradictingArticles": ArticleRecord[],
-    "summary": string
-  } | null,
-  "alignment": {
-    "score": number,
-    "label": "Low"|"Medium"|"High"|"Critical",
-    "aligningArticles": ArticleRecord[],
-    "boostedImpactScore": number,
-    "summary": string
-  } | null,
-  "marketImpact": {
-    "prediction": "buy"|"sell"|"hold"|"neutral",
-    "confidence": number,
-    "reasoning": string
-  },
-  "tweet1": string,
-  "tweet2": string,
-  "tweet1PostResult": { "posted": boolean, "tweetId"?: string, "tweetUrl"?: string, "reason"?: string },
-  "tweet2PostResult": { "posted": boolean, "tweetId"?: string, "tweetUrl"?: string, "reason"?: string, "delayMinutes"?: number } | null,
-  "tweet2AlgoDecision": string
+  "newsId": string, "articleDbId": string, "alreadyInDatabase": boolean,
+  "volatilityGate": "PROCEED"|"SKIP", "vixLevel": number, "vixContext": "HIGH"|"ELEVATED"|"LOW",
+  "affectedTickers": string[], "newTickersInserted": string[],
+  "relevanceScore": number, "signalQuality": "HIGH"|"MEDIUM"|"LOW",
+  "isRepeatSubject": boolean,
+  "contradiction": { "score": number, "label": "Low"|"Medium"|"High"|"Critical", "contradictingArticles": ArticleRecord[], "summary": string } | null,
+  "alignment": { "score": number, "label": "Low"|"Medium"|"High"|"Critical", "aligningArticles": ArticleRecord[], "boostedImpactScore": number, "summary": string } | null,
+  "marketImpact": { "prediction": "buy"|"sell"|"hold"|"neutral", "confidence": number, "reasoning": string },
+  "mainTweet": string, "replyTweet": string, "quoteTweet": string,
+  "mainTweetPostResult": { "posted": boolean, "tweetId"?: string, "tweetUrl"?: string, "reason"?: string },
+  "replyPostResult": { "posted": boolean, "tweetId"?: string, "replyUrl"?: string, "reason"?: string },
+  "quoteTweetPostResult": { "posted": boolean, "tweetId"?: string, "tweetUrl"?: string, "reason"?: string } | null,
+  "mainTweetImpressions": number
 }
 `;
-
- 
 
 // ─────────────────────────────────────────────
 // MAIN ANALYSIS FUNCTION
 // ─────────────────────────────────────────────
 
 export async function analyzeNews(news: NewsObject): Promise<AnalysisResult> {
-  const { gemini_api_key } = config;
 
-  if (!gemini_api_key) {
-    return Promise.reject(new Error("Gemini API key is not configured."));
+  if (!config.gemini_api_key) {
+    throw new Error("GEMINI_API_KEY is not configured.");
   }
 
-  const genAI = new GoogleGenAI({ apiKey: gemini_api_key});
+  const genAI = new GoogleGenAI({ apiKey: config.gemini_api_key });
 
   const chat = genAI.chats.create({
-    model: "gemini-2.5-flash-lite",
+    model: GEMINI_MODEL,
     config: {
       tools: [tools],
-      systemInstruction: {
-        parts: [{ text: SYSTEM_PROMPT }],
-      },
-      thinkingConfig: { 
-        includeThoughts: false,
-      }
+      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
     },
   });
 
-   // Track which turn we're on so PostHog events are distinguishable
-  let turnIndex = 0;
+  // ── PostHog run-level accumulators ────────────────────────────────────────
+  let phInputTokens  = 0;
+  let phOutputTokens = 0;
+  let phTurnCount    = 0;
+  const phToolCalls: string[] = [];
+  const phTraceId = `news-${news.id}-${Date.now()}`;
 
-  // ── Helper: wrap sendMessage with PostHog tracking ──────────────────────
-  async function sendTracked(payload: Parameters<typeof chat.sendMessage>[0]) {
-    const startTime = Date.now();
-    let response: Awaited<ReturnType<typeof chat.sendMessage>>;
+  // Wraps sendMessage with rate limiting + PostHog token accumulation
+  const send = async (msgPayload: Parameters<typeof chat.sendMessage>[0]) => {
+    const res = await rateLimitedSend(() => chat.sendMessage(msgPayload));
 
-    try {
-      response = await chat.sendMessage(payload);
-    } catch (err) {
-      // Capture failed LLM calls too
-      phClient.capture({
-        distinctId: news.id,           // ties all events for this news item together
-        event: "$ai_generation",
-        properties: {
-          $ai_provider:    "google",
-          $ai_model:       "gemini-2.5-flash",
-          $ai_error:       String(err),
-          $ai_is_error:    true,
-          $ai_latency:     (Date.now() - startTime) / 1000,
-          news_id:         news.id,
-          news_headline:   news.headline,
-          turn_index:      turnIndex,
-        },
-      });
-      throw err;
-    }
+    const usage = (res as Record<string, any>).usageMetadata as
+      { promptTokenCount?: number; candidatesTokenCount?: number } | undefined;
+    phInputTokens  += usage?.promptTokenCount     ?? 0;
+    phOutputTokens += usage?.candidatesTokenCount ?? 0;
+    phTurnCount    += 1;
 
-    const usage = response.usageMetadata;
+    return res;
+  };
 
-    // ✅ Capture one $ai_generation event per sendMessage call
-    phClient.capture({
-      distinctId: news.id,             // group all turns for this article together
-      event: "$ai_generation",
-      properties: {
-        // ── Standard PostHog LLM properties ──
-        $ai_provider:          "google",
-        $ai_model:             "gemini-2.5-flash",
-        $ai_input_tokens:      usage?.promptTokenCount        ?? 0,
-        $ai_output_tokens:     usage?.candidatesTokenCount    ?? 0,
-        $ai_total_tokens:      usage?.totalTokenCount         ?? 0,
-        $ai_latency:           (Date.now() - startTime) / 1000,  // seconds
-        $ai_is_error:          false,
-
-        // ── Custom properties for your app ──
-        news_id:               news.id,
-        news_headline:         news.headline,
-        news_source:           news.source,
-        turn_index:            turnIndex,           // 0 = initial prompt, 1+ = tool returns
-        is_tool_response_turn: turnIndex > 0,
-      },
-    });
-
-    turnIndex++;
-    return response;
-  }
-
-  // ── Initial message ───────────────────────────────────────────────────────
-  let response = await sendTracked({
+  let response = await send({
     message: `Analyze this news object:\n${JSON.stringify(news, null, 2)}`,
   });
 
@@ -1312,9 +1639,7 @@ export async function analyzeNews(news: NewsObject): Promise<AnalysisResult> {
     const functionCallParts = parts.filter((p) => p.functionCall);
 
     if (functionCallParts.length === 0) {
-      // ── Final response — flush PostHog before returning ──────────────────
-      await phClient.shutdown();     // ensures buffered events are flushed
-
+      // No function calls — Gemini is done, parse final JSON
       const rawText = parts.find((p) => p.text)?.text ?? "";
       const cleaned = rawText.replace(/```json|```/gi, "").trim();
 
@@ -1325,6 +1650,7 @@ export async function analyzeNews(news: NewsObject): Promise<AnalysisResult> {
         throw new Error(`Failed to parse Gemini final JSON:\n${rawText}`);
       }
 
+      // Enforce correct score labels regardless of what Gemini produced
       if (result.contradiction) {
         result.contradiction.label = scoreToLabel(result.contradiction.score);
       }
@@ -1333,24 +1659,82 @@ export async function analyzeNews(news: NewsObject): Promise<AnalysisResult> {
         result.alignment.boostedImpactScore = Math.min(100, result.alignment.boostedImpactScore);
       }
 
-      result.newTickersInserted  = result.newTickersInserted  ?? [];
-      result.tweet1              = result.tweet1              ?? "";
-      result.tweet2              = result.tweet2              ?? "";
-      result.tweet1PostResult    = result.tweet1PostResult    ?? { posted: false, reason: "not_attempted" };
-      result.tweet2PostResult    = result.tweet2PostResult    ?? null;
-      result.tweet2AlgoDecision  = result.tweet2AlgoDecision  ?? "";
+      result.newTickersInserted    = result.newTickersInserted    ?? [];
+      result.volatilityGate        = result.volatilityGate        ?? "SKIP";
+      result.vixLevel              = result.vixLevel              ?? 0;
+      result.vixContext            = result.vixContext            ?? "LOW";
+      result.relevanceScore        = result.relevanceScore        ?? 0;
+      result.signalQuality         = result.signalQuality         ?? "LOW";
+      result.isRepeatSubject       = result.isRepeatSubject       ?? false;
+      result.mainTweet             = result.mainTweet             ?? "";
+      result.replyTweet            = result.replyTweet            ?? "";
+      result.quoteTweet            = result.quoteTweet            ?? "";
+      result.mainTweetPostResult   = result.mainTweetPostResult   ?? { posted: false, reason: "not_attempted" };
+      result.replyPostResult       = result.replyPostResult       ?? { posted: false, reason: "not_attempted" };
+      result.quoteTweetPostResult  = result.quoteTweetPostResult  ?? null;
+      result.mainTweetImpressions  = result.mainTweetImpressions  ?? 0;
+      
+      // ! TODO: comeback and talk about this 
+      // result.tweet1              = result.tweet1              ?? "";
+      // result.tweet2              = result.tweet2              ?? "";
+      // result.tweet1PostResult    = result.tweet1PostResult    ?? { posted: false, reason: "not_attempted" };
+      // result.tweet2PostResult    = result.tweet2PostResult    ?? null;
+      // result.tweet2AlgoDecision  = result.tweet2AlgoDecision  ?? "";
+
+      // ── Fire PostHog summary event for this analysis run ────────────────
+      // One event per article — captures full token usage, cost estimate,
+      // tool call sequence, and outcome so you can track spend in PostHog.
+      const estimatedCostUsd =
+        (phInputTokens  / 1_000_000) * 0.30 +   // $0.30 per M input tokens
+        (phOutputTokens / 1_000_000) * 2.50;     // $2.50 per M output tokens
+
+      phClient.capture({
+        distinctId:  `news-analyzer`,
+        event:       "$ai_generation",
+        properties: {
+          // Standard PostHog AI properties
+          $ai_trace_id:       phTraceId,
+          $ai_model:          GEMINI_MODEL,
+          $ai_provider:       "google",
+          $ai_input_tokens:   phInputTokens,
+          $ai_output_tokens:  phOutputTokens,
+          $ai_total_tokens:   phInputTokens + phOutputTokens,
+          // Custom properties for your dashboard
+          news_id:            news.id,
+          news_source:        news.source,
+          news_category:      news.category ?? null,
+          affected_tickers:   result.affectedTickers,
+          market_prediction:  result.marketImpact.prediction,
+          confidence:         result.marketImpact.confidence,
+          turn_count:         phTurnCount,
+          tool_calls:         phToolCalls,
+          tweet1_posted:      result.mainTweetPostResult.posted,
+          tweet2_posted:      result.replyPostResult?.posted ?? false,
+          tweet2_skipped:     result.replyPostResult === null,
+          already_in_db:      result.alreadyInDatabase,
+          estimated_cost_usd: parseFloat(estimatedCostUsd.toFixed(6)),
+        },
+      });
+
+      // Flush async — don't block the return
+      phClient.flush().catch((e) =>
+        logger.warn(`PostHog flush error: ${e}`)
+      );
 
       return result;
     }
 
-    // ── Execute tool calls ────────────────────────────────────────────────
+    // Execute tool calls and return results to Gemini
     const toolResults = await Promise.all(
       functionCallParts.map(async (part) => {
         const { name, args } = part.functionCall!;
         if (!name) throw new Error("Tool call had no name.");
 
         logger.info(`🔧 Tool call → ${name}`);
-        logger.debug(`Args: ${JSON.stringify(args, null, 2)}`);
+        logger.debug(`   Args: ${JSON.stringify(args, null, 2)}`);
+
+        // Track tool call sequence for PostHog
+        phToolCalls.push(name);
 
         const impl = toolImplementations[name];
         if (!impl) throw new Error(`No implementation for tool: ${name}`);
@@ -1364,11 +1748,9 @@ export async function analyzeNews(news: NewsObject): Promise<AnalysisResult> {
       })
     );
 
-    // ✅ sendMessage for tool results is also tracked
-    response = await sendTracked({ message: toolResults });
+    response = await send({ message: toolResults });
   }
 }
-
 
 // ─────────────────────────────────────────────
 // EXAMPLE USAGE
@@ -1376,25 +1758,19 @@ export async function analyzeNews(news: NewsObject): Promise<AnalysisResult> {
 
 export async function main() {
   const exampleNews: NewsObject = {
-  id: "news-20260314-001",
-  headline: "Brent crude settles above $103 for first time since 2022 as Strait of Hormuz closure enters third week, S&P 500 posts third straight weekly loss",
-  body: `Brent crude futures settled at $103.14 per barrel on Friday, crossing the $100 threshold for the first time since August 2022, as the U.S.-Israel war with Iran kept the Strait of Hormuz virtually shut for a third consecutive week. West Texas Intermediate settled at $98.71, up 3.11% on the day.
-
-  The closure is disrupting an estimated 7.5% of global oil supply according to the International Energy Agency, which coordinated an emergency release of 400 million barrels from member stockpiles — a move that did little to cool prices. U.S. Energy Secretary Chris Wright told CNBC the Navy is "simply not ready" to escort tankers through the strait, adding operations could begin "relatively soon."
-
-  Equity markets absorbed another brutal session. The S&P 500 fell 1.6% for the week, posting its first three-week losing streak in nearly a year and setting a new 2026 low. The Dow shed 2% week-to-date. Stagflation fears are mounting after the Commerce Department revised Q4 2025 GDP growth down to 0.7% from 1.4%, while January PCE inflation held at 2.8% year-over-year — data that predates the oil shock entirely.
-
-  Goldman Sachs and Bank of America both revised oil price forecasts higher Friday. The CME FedWatch Tool now shows rate cut odds above 50% pushed out to September at the earliest, with two-cut scenarios for 2026 collapsing from 85% a month ago to 35% today. Energy was the only S&P 500 sector to close higher. Occidental Petroleum, EOG Resources and Marathon Petroleum hit fresh 52-week highs.`,
-  source: "CNBC",
-  url: "https://www.cnbc.com/2026/03/12/stock-market-today-live-updates.html",
-  publishedAt: new Date("2026-03-14T20:45:00.000Z").toISOString(),
-  category: "macro",
-  metadata: {
-    sentiment: "negative",
-    region: "global",
-    sector: "Energy/Macro"
-  }
-};
+    id: "news-20240315-001",
+    headline: "Apple beats Q2 estimates with $94.9B revenue; announces $90B buyback",
+    body: `Apple Inc. reported second-quarter revenue of $94.9 billion on Tuesday,
+           surpassing Wall Street expectations of $92.1 billion. CEO Tim Cook cited
+           record iPhone 15 sales in India and double-digit Services growth as key
+           drivers. The company also announced a $90 billion share repurchase program,
+           the largest in Apple history. EPS came in at $1.53 vs $1.43 expected.`,
+    source: "Reuters",
+    url: "https://reuters.com/technology/apple-q2-2024-earnings",
+    publishedAt: new Date().toISOString(),
+    category: "earnings",
+    metadata: { sentiment: "positive", region: "US", sector: "Technology" },
+  };
 
   logger.info(`📰 Analyzing news: ${exampleNews.headline}`);
 
@@ -1403,20 +1779,20 @@ export async function main() {
     logger.info(`📊 ANALYSIS COMPLETE\n${JSON.stringify(result, null, 2)}`);
 
     // Tweet 1 post result
-    if (result.tweet1PostResult.posted) {
-      logger.info(`✅ Tweet 1 posted: ${result.tweet1PostResult.tweetUrl}`);
+    if (result.mainTweetPostResult.posted) {
+      logger.info(`✅ Tweet 1 posted: ${result.mainTweetPostResult.tweetUrl}`);
     } else {
-      logger.warn(`⚠️  Tweet 1 not posted: ${result.tweet1PostResult.reason}`);
+      logger.warn(`⚠️  Tweet 1 not posted: ${result.mainTweetPostResult.reason}`);
     }
 
     // Tweet 2 algo decision + post result
-    logger.info(`🤖 Tweet 2 algo decision: ${result.tweet2AlgoDecision}`);
-    if (result.tweet2PostResult === null) {
+    // logger.info(`🤖 Tweet 2 algo decision: ${result.tweet2AlgoDecision}`);
+    if (result.quoteTweetPostResult === null) {
       logger.info(`⏭️  Tweet 2 skipped (low engagement potential)`);
-    } else if (result.tweet2PostResult.posted) {
-      logger.info(`✅ Tweet 2 posted after ${result.tweet2PostResult.delayMinutes} min: ${result.tweet2PostResult.tweetUrl}`);
+    } else if (result.quoteTweetPostResult?.posted) {
+      logger.info(`✅ Tweet 2 posted after ${result.quoteTweetPostResult.delayMinutes} min: ${result.quoteTweetPostResult.tweetUrl}`);
     } else {
-      logger.warn(`❌ Tweet 2 failed: ${result.tweet2PostResult.reason}`);
+      logger.warn(`❌ Tweet 2 failed: ${result.quoteTweetPostResult?.reason}`);
     }
 
     if (result.newTickersInserted.length > 0) {
@@ -1424,5 +1800,6 @@ export async function main() {
     }
   } catch (err) {
     logger.error(`❌ Analysis failed: ${err}`);
+    process.exit(1);
   }
 }

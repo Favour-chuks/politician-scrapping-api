@@ -24,6 +24,7 @@ export const config = {
  twitter_bearer_token: process.env.TWITTER_BEARER_TOKEN,
  twitter_access_token: process.env.TWITTER_ACCESS_TOKEN,
  twitter_access_token_secret: process.env.TWITTER_ACCESS_TOKEN_SECRET,
+ twitter_user_id: process.env.TWITTER_USER_ID,
  supabase_api_key: process.env.SUPABASE_API_KEY,
  supabase_url: process.env.SUPABASE_URL,
  supabase_service_role_key: process.env.SUPABASE_SERVICE_ROLE_KEY,
